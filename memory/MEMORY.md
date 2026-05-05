@@ -1,0 +1,2 @@
+- [User role](user_role.md) — PhD student building photonic LSU networks; knows the literature, addresses by ref number.
+- [LSU known issues](project_known_issues.md) — bond-collapse is energy-function-inherent, not a bug; jaxopt slower than scipy+JIT on CPU.

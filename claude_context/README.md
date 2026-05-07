@@ -11,11 +11,18 @@ target value (Φ_12 or Φ_22).
 ## Key files
 - `lsu_network.py` — the implementation module (sits in the project root).
 - `Create_LSU_Function.ipynb` — notebook the user runs; calls `generate_lsu_network`.
-- `Example/lsu_example_ends.txt` — reference output (1653 rods, periodicity 11.44 µm,
-  rods of length ~0.8 µm, Φ_12=0.99, Φ_22=0.89). Format: tab-separated, 7 columns
-  `[index, x1, y1, z1, x2, y2, z2]`.
-- `Example/lsu_generated.txt` — same but 6 columns (no index). The function emits
-  a `(num_rods, 6)` NumPy array compatible with this format.
+- `Example/lsu_example_ends.txt` — reference output, **1500 unique edges over
+  1000 trivalent vertices**, periodicity 11.44 µm, rod length ~0.8 µm,
+  Φ_12=0.99, Φ_22=0.89. The file has 1653 lines (6 tab-separated columns
+  `[x1, y1, z1, x2, y2, z2]`); the extra 153 lines are PBC-image duplicates
+  of the edges that cross box faces, emitted twice (once anchored at each
+  endpoint's canonical-box image). This duplication is required for
+  `create_permittivity_grid_penlike` to draw a periodic structure. Verified
+  2026-05-07: `compute_lsu` returns Φ_22=0.8886 / Φ_12=0.9849 on the
+  PBC-deduplicated reconstruction.
+- `Example/lsu_generated.txt` — generator output. The function emits a
+  `(R, 6)` NumPy array, `R = E + (face-crossing edges)` when the new default
+  `pbc_duplicate_boundary_rods=True` is used, or `R = E` when it's `False`.
 - `LSU Literature/ncomms14439.pdf` — Sellers et al. 2017 (main paper).
 - `LSU Literature/41467_2017_BFncomms14439_MOESM1815_ESM.pdf` — supplement with
   the actual algorithm (Supplementary Methods → Amorphous Gyroid Simulated Annealing).

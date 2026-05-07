@@ -1347,26 +1347,58 @@ def network_to_rods(
     positions: np.ndarray,
     edges: np.ndarray,
     box: np.ndarray,
+    pbc_duplicate_boundary_rods: bool = True,
 ) -> np.ndarray:
-    """Convert (positions, edges) → rod endpoints array shape (E, 6).
+    """Convert (positions, edges) → rod endpoints array shape (R, 6).
 
-    The first endpoint of each rod is the canonical-box image of one of the
-    two vertices; the second endpoint is reached from the first via the
-    minimum-image displacement, so it may extend outside [-L/2, L/2]^3 by
-    up to one rod length, matching the example file convention.
+    Each periodic-cell edge becomes one or two rods depending on whether it
+    crosses a box face:
+
+    - For an edge entirely inside the canonical box, one rod is emitted —
+      `(a_canon, a_canon + min_image(b - a))`.
+    - For an edge crossing ≥1 face, the same rule applied from b's
+      canonical position yields a different rod — `(b_canon, b_canon +
+      min_image(a - b))`. Both are emitted, matching the convention of the
+      Sellers reference file `lsu_example_ends.txt` (1500 unique edges →
+      1653 rendered rods, 153 duplicates from face-crossing edges).
+
+    The dual rendering is required when downstream code (e.g.
+    ``create_permittivity_grid_penlike``) draws each rod as a literal
+    cylinder without applying PBC: without the second image, structure
+    crossing the +x face is drawn extending past +x but is missing on the
+    -x side, breaking the periodicity of the resulting permittivity grid.
+
+    Set ``pbc_duplicate_boundary_rods=False`` to suppress duplication and
+    get one rod per unique edge (the prior behaviour). Output shape is
+    then exactly ``(E, 6)``.
+
+    Returns
+    -------
+    rods : ndarray, shape ``(R, 6)``
+        ``R = E`` if ``pbc_duplicate_boundary_rods=False`` else
+        ``R = E + (number of face-crossing edges)`` ≤ ``2E``.
     """
-    half = box / 2.0
-    # Bring all vertex positions into the canonical box [-L/2, L/2]
-    pos_canon = positions.copy()
-    pos_canon = pos_canon - box * np.round(pos_canon / box)
+    pos_canon = positions - box * np.round(positions / box)
 
-    p1 = pos_canon[edges[:, 0]]
-    p2 = pos_canon[edges[:, 1]]
-    d = pbc_displacement(p2 - p1, box)
-    p2_unwrapped = p1 + d
+    a_canon = pos_canon[edges[:, 0]]
+    b_canon = pos_canon[edges[:, 1]]
+    d_ab = pbc_displacement(b_canon - a_canon, box)
 
-    out = np.concatenate([p1, p2_unwrapped], axis=1)
-    return out
+    # Render 1: a_canon as the in-box endpoint.
+    render_a = np.concatenate([a_canon, a_canon + d_ab], axis=1)
+
+    if not pbc_duplicate_boundary_rods:
+        return render_a
+
+    # Render 2: b_canon as the in-box endpoint. Distinct from render 1 iff
+    # the edge crosses ≥1 face (i.e. a_canon + d_ab != b_canon).
+    render_b = np.concatenate([b_canon, b_canon - d_ab], axis=1)
+
+    # An edge crosses a face iff a_canon + d_ab differs from b_canon. Use
+    # a generous tolerance so floating-point noise on interior edges
+    # doesn't get duplicated.
+    crosses = np.any(np.abs(a_canon + d_ab - b_canon) > 1e-9, axis=1)
+    return np.concatenate([render_a, render_b[crosses]], axis=0)
 
 
 # --------------------------------------------------------------------------- #
@@ -1375,7 +1407,8 @@ def network_to_rods(
 def generate_lsu_network(
     lsu_degree_12: Optional[float] = None,
     lsu_degree_22: Optional[float] = None,
-    num_rods: int = 1653,
+    num_rods: Optional[int] = None,
+    num_vertices: Optional[int] = None,
     bounds_microns: Union[float, Tuple[float, float, float]] = 11.44,
     edge_length: float = 0.8,
     n_www_iterations: int = 20_000,
@@ -1391,6 +1424,7 @@ def generate_lsu_network(
     seed: int = 42,
     use_jax: Optional[bool] = None,
     use_jaxopt: bool = False,
+    pbc_duplicate_boundary_rods: bool = True,
     verbose: bool = True,
 ) -> np.ndarray:
     """Generate a 3D periodic amorphous trivalent network with prescribed LSU.
@@ -1404,10 +1438,19 @@ def generate_lsu_network(
     ----------
     lsu_degree_12, lsu_degree_22 : float, optional
         Target Φ_{1,1} or Φ_{2,2}. Provide exactly one of the two.
-    num_rods : int
-        Number of edges (rods) in the output. Must be divisible by 3 so that
+    num_rods : int, optional
+        Number of unique periodic-cell edges. Must be divisible by 3 so that
         the corresponding number of trivalent vertices V = 2·num_rods/3
-        is an integer (and even).
+        is an integer (and even). The rendered output may contain more rows
+        than ``num_rods`` because edges crossing box faces are emitted twice
+        when ``pbc_duplicate_boundary_rods=True`` (default). Provide exactly
+        one of ``num_rods`` or ``num_vertices``.
+    num_vertices : int, optional
+        Number of trivalent vertices in the periodic cell. Must be even.
+        Equivalent to setting ``num_rods = 3 * num_vertices // 2``. Use this
+        when matching a known-N reference (e.g. the Sellers `lsu_example_ends.txt`
+        is N=1000 / E=1500, rendered as 1653 rod lines). Provide exactly one
+        of ``num_rods`` or ``num_vertices``.
     bounds_microns : float or 3-tuple
         Side length(s) of the periodic cubic/orthorhombic box.
     edge_length : float
@@ -1458,29 +1501,52 @@ def generate_lsu_network(
         ``jaxopt.LBFGS`` instead of scipy. Benchmarked: slower than
         scipy+JAX for N≤2000 on current hardware (~1.3 s vs ~84 ms for
         N=1102, 100 iters). Only consider enabling for very large N on GPU.
+    pbc_duplicate_boundary_rods : bool
+        If True (default), emit each face-crossing edge twice — once
+        anchored at each canonical-box endpoint — matching the convention
+        of the Sellers reference file `lsu_example_ends.txt`. Required for
+        downstream code (e.g. ``create_permittivity_grid_penlike``) that
+        draws rods as literal cylinders without applying PBC: without the
+        duplicates the rendered structure is not periodic across box
+        faces. Set to False to suppress duplication and emit one rod per
+        unique edge.
     verbose : bool
         Print progress every ``check_lsu_every`` iterations.
 
     Returns
     -------
-    rods : ndarray, shape (num_rods, 6), dtype float64
-        Each row is ``[x1, y1, z1, x2, y2, z2]``.
+    rods : ndarray, shape (R, 6), dtype float64
+        Each row is ``[x1, y1, z1, x2, y2, z2]``. ``R`` equals the unique
+        edge count ``E = 3N/2`` if ``pbc_duplicate_boundary_rods=False``,
+        otherwise ``R`` = ``E`` plus the number of edges that cross at
+        least one box face.
     """
     if (lsu_degree_12 is None) == (lsu_degree_22 is None):
         raise ValueError(
             "Provide exactly one of `lsu_degree_12` or `lsu_degree_22`.")
 
-    if num_rods % 3 != 0:
+    if (num_rods is None) == (num_vertices is None):
         raise ValueError(
-            f"num_rods must be divisible by 3 (got {num_rods}); for a "
-            f"trivalent graph 2*E = 3*V."
-        )
-    N = (2 * num_rods) // 3
-    if N % 2 != 0:
-        raise ValueError(
-            f"num_rods={num_rods} ⇒ N={N} vertices, which is odd; "
-            f"a 3-regular graph needs N even."
-        )
+            "Provide exactly one of `num_rods` or `num_vertices`.")
+    if num_vertices is not None:
+        if num_vertices % 2 != 0:
+            raise ValueError(
+                f"num_vertices must be even (got {num_vertices}); a "
+                f"3-regular graph requires 2*E = 3*N with N even.")
+        N = int(num_vertices)
+        num_rods = (3 * N) // 2
+    else:
+        if num_rods % 3 != 0:
+            raise ValueError(
+                f"num_rods must be divisible by 3 (got {num_rods}); for a "
+                f"trivalent graph 2*E = 3*V."
+            )
+        N = (2 * num_rods) // 3
+        if N % 2 != 0:
+            raise ValueError(
+                f"num_rods={num_rods} ⇒ N={N} vertices, which is odd; "
+                f"a 3-regular graph needs N even."
+            )
 
     box = coerce_box(bounds_microns)
     use_jax = HAS_JAX if use_jax is None else (use_jax and HAS_JAX)
@@ -1564,7 +1630,8 @@ def generate_lsu_network(
                            "happen if SW moves rejected disconnections; "
                            "please report.")
 
-    rods = network_to_rods(positions, edges, box)
+    rods = network_to_rods(positions, edges, box,
+                           pbc_duplicate_boundary_rods=pbc_duplicate_boundary_rods)
     if verbose:
         # Final LSU
         phi_final = compute_lsu(positions, edges, neighbors, box,
@@ -1576,4 +1643,12 @@ def generate_lsu_network(
         print(f"[gen] rod lengths: mean={rod_lengths.mean():.3f}, "
               f"std={rod_lengths.std():.3f}, "
               f"min={rod_lengths.min():.3f}, max={rod_lengths.max():.3f}")
+        if pbc_duplicate_boundary_rods:
+            n_extra = rods.shape[0] - num_rods
+            print(f"[gen] rendered {rods.shape[0]} rods "
+                  f"({num_rods} unique edges + {n_extra} PBC-image duplicates "
+                  f"for face-crossing edges)")
+        else:
+            print(f"[gen] rendered {rods.shape[0]} rods (one per unique edge; "
+                  f"PBC duplication disabled)")
     return rods

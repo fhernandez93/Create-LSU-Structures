@@ -78,7 +78,13 @@
    - `phi_ab(tree_a, tree_b)` — average over all γ! permutations (Eq. 1).
    - `compute_lsu(positions, neighbors, edges, box, depth, locality, sample)`
      — average ϕ over (a,b) pairs.
-9. **Output formatting** — `network_to_rods(positions, edges, box)`.
+9. **Output formatting** — `network_to_rods(positions, edges, box,
+   pbc_duplicate_boundary_rods=True)`. With duplication on (default) each
+   face-crossing edge is emitted twice — once anchored at each canonical-box
+   endpoint — matching the Sellers reference convention and producing a
+   periodic permittivity grid downstream. `pbc_duplicate_boundary_rods=False`
+   gives one row per unique edge (legacy behaviour, kept for callers that
+   PBC-tile downstream themselves).
 10. **Public entry point** — `generate_lsu_network(...)`.
 
 ## Performance (measured, Windows 11, CPU only)

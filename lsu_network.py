@@ -1343,11 +1343,40 @@ def compute_lsu(
 # --------------------------------------------------------------------------- #
 # Output formatting
 # --------------------------------------------------------------------------- #
+def _clip_second_endpoint_to_box(
+    p1: np.ndarray, p2: np.ndarray, box: np.ndarray
+) -> np.ndarray:
+    """Vectorised: for each rod with p1 inside [-L/2, L/2]^3 and p2 possibly
+    outside, return p2' on the line p1→p2 such that p2' lies on the nearest
+    box face along the rod direction. Rods entirely inside the box are
+    returned unchanged.
+    """
+    half = box / 2.0
+    direction = p2 - p1                          # shape (E, 3)
+    n_rods = p1.shape[0]
+    t_min = np.ones(n_rods, dtype=p1.dtype)      # default: keep p2
+
+    eps = 1e-12
+    safe_dir = np.where(np.abs(direction) > eps, direction, np.inf)
+    # For each axis, compute t where line crosses ±half[axis]
+    for axis in range(3):
+        for face in (half[axis], -half[axis]):
+            t_face = (face - p1[:, axis]) / safe_dir[:, axis]
+            # Take the smallest positive t (first face hit going from p1)
+            t_min = np.where((t_face > eps) & (t_face < t_min), t_face, t_min)
+
+    # Only clip rods whose p2 is actually outside the box
+    outside = np.any(np.abs(p2) > half + 1e-9, axis=1)
+    t_eff = np.where(outside, t_min, np.ones_like(t_min))
+    return p1 + t_eff[:, None] * direction
+
+
 def network_to_rods(
     positions: np.ndarray,
     edges: np.ndarray,
     box: np.ndarray,
     pbc_duplicate_boundary_rods: bool = True,
+    clip_endpoints_to_box: bool = True,
 ) -> np.ndarray:
     """Convert (positions, edges) → rod endpoints array shape (R, 6).
 
@@ -1368,9 +1397,22 @@ def network_to_rods(
     crossing the +x face is drawn extending past +x but is missing on the
     -x side, breaking the periodicity of the resulting permittivity grid.
 
-    Set ``pbc_duplicate_boundary_rods=False`` to suppress duplication and
-    get one rod per unique edge (the prior behaviour). Output shape is
-    then exactly ``(E, 6)``.
+    Parameters
+    ----------
+    pbc_duplicate_boundary_rods : bool
+        Set to False to suppress duplication and get one rod per unique
+        edge (output shape ``(E, 6)``).
+    clip_endpoints_to_box : bool
+        Default True. The second endpoint of each rod (``p2``) is clipped
+        to land on the nearest box face along the rod direction whenever
+        ``p2`` lies outside the canonical box ``[-L/2, L/2]^3``. The
+        first endpoint is always inside (it's the canonical-box image of
+        a vertex). Clipping does **not** change the structure rendered
+        by ``create_permittivity_grid_penlike`` (which clips at grid
+        bounds anyway), but it makes a centerline visualisation in
+        ParaView fit cleanly inside the cube outline. Set to False to
+        keep the historical behaviour where rods can extend up to one
+        bond length beyond the cube.
 
     Returns
     -------
@@ -1387,18 +1429,25 @@ def network_to_rods(
     # Render 1: a_canon as the in-box endpoint.
     render_a = np.concatenate([a_canon, a_canon + d_ab], axis=1)
 
-    if not pbc_duplicate_boundary_rods:
-        return render_a
+    if pbc_duplicate_boundary_rods:
+        # Render 2: b_canon as the in-box endpoint. Distinct from render 1
+        # iff the edge crosses ≥1 face (i.e. a_canon + d_ab != b_canon).
+        render_b = np.concatenate([b_canon, b_canon - d_ab], axis=1)
+        crosses = np.any(np.abs(a_canon + d_ab - b_canon) > 1e-9, axis=1)
+        out = np.concatenate([render_a, render_b[crosses]], axis=0)
+    else:
+        out = render_a
 
-    # Render 2: b_canon as the in-box endpoint. Distinct from render 1 iff
-    # the edge crosses ≥1 face (i.e. a_canon + d_ab != b_canon).
-    render_b = np.concatenate([b_canon, b_canon - d_ab], axis=1)
+    if clip_endpoints_to_box:
+        # Clip the second endpoint to land on the nearest box face. The
+        # first endpoint is the canonical-box image of a vertex (always
+        # inside [-L/2, L/2]^3), so we only need to clip p2.
+        p1 = out[:, :3]
+        p2 = out[:, 3:]
+        p2_clipped = _clip_second_endpoint_to_box(p1, p2, box)
+        out = np.concatenate([p1, p2_clipped], axis=1)
 
-    # An edge crosses a face iff a_canon + d_ab differs from b_canon. Use
-    # a generous tolerance so floating-point noise on interior edges
-    # doesn't get duplicated.
-    crosses = np.any(np.abs(a_canon + d_ab - b_canon) > 1e-9, axis=1)
-    return np.concatenate([render_a, render_b[crosses]], axis=0)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -1425,6 +1474,7 @@ def generate_lsu_network(
     use_jax: Optional[bool] = None,
     use_jaxopt: bool = False,
     pbc_duplicate_boundary_rods: bool = True,
+    clip_endpoints_to_box: bool = False,
     verbose: bool = True,
 ) -> np.ndarray:
     """Generate a 3D periodic amorphous trivalent network with prescribed LSU.
@@ -1510,6 +1560,16 @@ def generate_lsu_network(
         duplicates the rendered structure is not periodic across box
         faces. Set to False to suppress duplication and emit one rod per
         unique edge.
+    clip_endpoints_to_box : bool
+        If True (default), the second endpoint of each rod (``p2``) is
+        clipped to the nearest box face along the rod direction whenever
+        it would extend outside the canonical box. The first endpoint is
+        always inside. Clipping does **not** change the structure rendered
+        by ``create_permittivity_grid_penlike`` (which clips at grid
+        bounds anyway), but it makes a centerline visualisation in
+        ParaView fit cleanly inside the cube outline. Set to False to
+        keep the historical behaviour where rods can extend up to one
+        bond length beyond the cube.
     verbose : bool
         Print progress every ``check_lsu_every`` iterations.
 
@@ -1631,7 +1691,8 @@ def generate_lsu_network(
                            "please report.")
 
     rods = network_to_rods(positions, edges, box,
-                           pbc_duplicate_boundary_rods=pbc_duplicate_boundary_rods)
+                           pbc_duplicate_boundary_rods=pbc_duplicate_boundary_rods,
+                           clip_endpoints_to_box=clip_endpoints_to_box)
     if verbose:
         # Final LSU
         phi_final = compute_lsu(positions, edges, neighbors, box,

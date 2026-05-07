@@ -15,6 +15,7 @@ type: project
 - Either `num_rods` (unique periodic-cell edge count) or `num_vertices`, exactly one — they're equivalent, related by `num_rods = 3 * num_vertices // 2`. Use `num_vertices=1000` to match the reference topology.
 - `pbc_duplicate_boundary_rods=True` (default) — emits face-crossing edges twice. Output shape is `(E + B, 6)` where `B` is the count of face-crossing edges (statistical, ~150 for L=14.3 / d=1.0).
 - Set `pbc_duplicate_boundary_rods=False` for legacy single-render-per-edge behaviour, e.g. when downstream code PBC-tiles itself.
+- `clip_endpoints_to_box=True` (default) — the second endpoint of each rod is clipped to lie on the nearest box face along the rod direction whenever it would extend outside the canonical box. Cosmetic only: makes a centerline render in ParaView fit cleanly inside the cube outline. Does **not** affect the in-box geometry, so `create_permittivity_grid_penlike` produces the same permittivity grid either way (it clips at grid bounds anyway). Set to False to keep the previous behaviour where rods could extend up to one bond length beyond the cube.
 
 **How to apply.** When matching the reference, `num_vertices=1000` is the right choice — `num_rods=1653` builds a denser network (N=1102) than the reference. The rendered output count `len(rods)` will be ~1500 + boundary duplicates, close to but not exactly 1653 (depends on edge layout for the specific seed/box).
 

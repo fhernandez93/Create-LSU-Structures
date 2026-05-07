@@ -1,2 +1,3 @@
 - [User role](user_role.md) — PhD student building photonic LSU networks; knows the literature, addresses by ref number.
-- [LSU known issues](project_known_issues.md) — bond-collapse is energy-function-inherent, not a bug; jaxopt slower than scipy+JIT on CPU.
+- [LSU known issues](project_known_issues.md) — void clustering root cause is full-N L-BFGS deviating from Sellers-cited Vink/MB local-shell relax; bond-collapse secondary; jaxopt slower than scipy+JIT on CPU.
+- [LSU literature anchors](reference_lsu_literature.md) — no published {α,β,γ,δ} for Sellers four-term U; Sellers cites Vink/MB 2001 for relax refinements (4-shell local); Hemmann/Saba 2026 has no non-bonded vertex repulsion (corrected); Si Keating β/α≈0.285.

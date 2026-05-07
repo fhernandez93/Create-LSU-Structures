@@ -417,6 +417,32 @@ def build_neighbors(N: int, edges: np.ndarray) -> np.ndarray:
     return out
 
 
+def compute_local_shell_mask(
+    seed_vertices: np.ndarray,
+    neighbors: np.ndarray,
+    depth: int,
+    N: int,
+) -> np.ndarray:
+    """Boolean (N,) mask of vertices within `depth` graph-edge steps of any seed.
+
+    Used to restrict L-BFGS to a spatially local patch around a Stone-Wales
+    move, per the Vink / Mousseau-Barkema relaxation refinement that the
+    Sellers supplement (Methods, refs [13,14]) cites. Out-of-shell vertices
+    are held fixed by gradient-masking inside `relax`.
+    """
+    mask = np.zeros(N, dtype=bool)
+    mask[np.asarray(seed_vertices, dtype=np.int64)] = True
+    for _ in range(int(depth)):
+        true_idx = np.flatnonzero(mask)
+        if true_idx.size == 0:
+            break
+        nbr_idx = neighbors[true_idx].reshape(-1)
+        # Drop -1 sentinels just in case (degree-3 invariant should prevent any).
+        nbr_idx = nbr_idx[nbr_idx >= 0]
+        mask[nbr_idx] = True
+    return mask
+
+
 def build_angle_triples(neighbors: np.ndarray) -> np.ndarray:
     """For each vertex, return the 3 (vertex, nbr_a, nbr_b) angle triples.
 
@@ -602,11 +628,18 @@ if HAS_JAX:
     _value_and_grad_jit = jit(value_and_grad(_energy_jax_full, argnums=0))
 
     def _jax_value_and_grad(pos_flat, edges_j, triples_j, quads_j,
-                            box_j, d0, w_j):
+                            box_j, d0, w_j, mask_flat_j=None):
         e, g = _value_and_grad_jit(jnp.asarray(pos_flat),
                                    edges_j, triples_j, quads_j,
                                    box_j, d0, w_j)
-        return float(e), np.asarray(g, dtype=np.float64)
+        g_arr = np.asarray(g, dtype=np.float64)
+        if mask_flat_j is not None:
+            # Gradient masking implements the Vink/Mousseau-Barkema local relax
+            # that Sellers cites: out-of-shell vertices have zero gradient and
+            # L-BFGS doesn't move them. Applied host-side after the JIT call so
+            # the kernel signature (and JIT cache) stays unchanged.
+            g_arr = g_arr * np.asarray(mask_flat_j, dtype=np.float64)
+        return float(e), g_arr
 
     def _jaxopt_value_and_grad(x_flat, edges_j, triples_j, quads_j,
                                box_j, d0_j, w_j):
@@ -638,10 +671,17 @@ class _RelaxContext:
         self.weights = tuple(float(w) for w in weights)
         self.use_jax = bool(use_jax and HAS_JAX)
         self.use_jaxopt = bool(self.use_jax and use_jaxopt and HAS_JAXOPT)
+        # Per-vertex moving mask. None ⇒ unmasked (all vertices move).
+        # When set to a (N,) bool array, gradient is zeroed for frozen
+        # components so L-BFGS keeps them fixed. See compute_local_shell_mask
+        # and the Vink/Mousseau-Barkema relaxation that Sellers cites.
+        self._mask_flat: Optional[np.ndarray] = None
+        self._moving_idx: Optional[np.ndarray] = None
         if self.use_jax:
             self._box_j = jnp.asarray(self.box)
             self._w_j = jnp.asarray(self.weights)
             self._d0_j = jnp.float64(self.d0)
+            self._mask_flat_j = None
             # Cache jaxopt LBFGS instances keyed by (maxiter, tol). Each
             # instance lazily JIT-compiles its inner while-loop on first
             # call; reusing the same instance across WWW iterations keeps
@@ -650,6 +690,28 @@ class _RelaxContext:
             # scipy + jit'd autodiff is ~50-150x faster (jaxopt's per-call
             # host dispatch overhead is ~2s regardless of problem size).
             self._jaxopt_solvers: dict = {}
+
+    def set_moving_mask(self, mask: Optional[np.ndarray]) -> None:
+        """Set the per-vertex boolean mask. None ⇒ all vertices move (full-N).
+
+        For the JAX path the mask is broadcast to (N, 3) and applied to the
+        gradient. For the NumPy path the moving sub-vector indices are cached
+        for use by `relax`.
+        """
+        if mask is None:
+            self._mask_flat = None
+            self._moving_idx = None
+            if self.use_jax:
+                self._mask_flat_j = None
+            return
+        mask = np.asarray(mask, dtype=bool)
+        if mask.shape != (self.N,):
+            raise ValueError(f"mask shape {mask.shape} != ({self.N},)")
+        flat = np.broadcast_to(mask[:, None], (self.N, 3)).reshape(-1)
+        self._mask_flat = flat.astype(np.float64)
+        self._moving_idx = np.flatnonzero(flat)
+        if self.use_jax:
+            self._mask_flat_j = jnp.asarray(self._mask_flat)
 
     def get_jaxopt_solver(self, max_iter: int, tol: float):
         if not self.use_jaxopt:
@@ -685,6 +747,7 @@ class _RelaxContext:
                 positions_flat,
                 self._edges_j, self._triples_j, self._quads_j,
                 self._box_j, self._d0_j, self._w_j,
+                mask_flat_j=self._mask_flat_j,
             )
         # NumPy path: compute energy and use scipy's finite-difference gradient.
         e = total_energy(positions_flat, self.N, self.edges, self.triples,
@@ -708,18 +771,22 @@ def relax(
 ) -> Tuple[np.ndarray, float]:
     """L-BFGS relaxation using the cached JIT'd kernel in `ctx`.
 
-    There's no separate "local" routine — vertices already at a local minimum
-    have ~zero gradient and don't move under L-BFGS, so a small `max_iter`
-    after a Stone-Wales move acts as a local relaxation while a large
-    `max_iter` does the full global polish.
+    If `ctx.set_moving_mask(mask)` has been called with a non-None mask, the
+    relaxation is restricted to the masked vertices: out-of-shell positions
+    are held fixed (Vink/Mousseau-Barkema scheme that Sellers cites). On the
+    JAX path this is implemented by zeroing the gradient for frozen
+    components inside `_jax_value_and_grad`. On the NumPy path the moving
+    DOFs are passed to scipy as a sub-vector, with frozen positions held
+    constant inside the closure.
 
     Default JAX path: ``scipy.optimize.minimize(method="L-BFGS-B")`` driving
     the JIT-compiled ``value_and_grad`` (single host→device call per
     gradient eval, ~26 µs on CPU). Optional ``ctx.use_jaxopt=True`` swaps
     in ``jaxopt.LBFGS`` which keeps the L-BFGS loop on-device — only worth
     it on a GPU; on CPU jaxopt's per-call dispatch overhead (~2 s) makes
-    it 50–150× slower than scipy+JIT regardless of problem size.
-    Pure-NumPy path uses scipy with finite differences.
+    it 50–150× slower than scipy+JIT regardless of problem size. The
+    jaxopt path does NOT honour the moving mask (cf. set_moving_mask) yet;
+    use the default scipy+JIT path for local-shell relaxation.
     """
     if ctx.use_jaxopt:
         solver = ctx.get_jaxopt_solver(max_iter, tol)
@@ -732,11 +799,29 @@ def relax(
         new_pos = np.asarray(res.params, dtype=np.float64).reshape(ctx.N, 3)
         return new_pos, float(res.state.value)
     if ctx.use_jax:
+        # Mask (if any) is applied inside ctx.value_and_grad — frozen
+        # components have zero gradient and L-BFGS leaves them fixed.
         def fun(x):
             return ctx.value_and_grad(x)
         res = minimize(fun, positions.reshape(-1), jac=True, method="L-BFGS-B",
                        options={"maxiter": max_iter, "gtol": tol})
         return res.x.reshape(ctx.N, 3), float(res.fun)
+
+    # NumPy path. If a mask is set, optimise only the moving DOFs as a
+    # sub-vector; scipy's finite-difference gradient then perturbs only those.
+    if ctx._moving_idx is not None:
+        full = positions.reshape(-1).copy()
+        moving = ctx._moving_idx
+
+        def fun_sub(x_sub):
+            full[moving] = x_sub
+            return ctx.energy(full)
+
+        x0 = full[moving].copy()
+        res = minimize(fun_sub, x0, method="L-BFGS-B",
+                       options={"maxiter": max_iter, "gtol": tol})
+        full[moving] = res.x
+        return full.reshape(ctx.N, 3), float(res.fun)
 
     def fun(x):
         return ctx.energy(x)
@@ -863,6 +948,7 @@ def www_anneal(
     relax_local_iters: int = 100,
     relax_global_iters: int = 500,
     relax_global_every: int = 200,
+    local_shell_depth: Optional[int] = 4,
     check_lsu_every: int = 500,
     use_jax: bool = False,
     use_jaxopt: bool = False,
@@ -889,6 +975,7 @@ def www_anneal(
         if move is None:
             continue
         proposed += 1
+        _ek1, (sw_i, sw_c, sw_j, sw_d), _ek2 = move
 
         # Snapshot positions for revert
         pos_before = positions.copy()
@@ -902,9 +989,19 @@ def www_anneal(
         # Topology changed → refresh triples/quads (and JAX device arrays).
         ctx.update_topology(edges, neighbors)
 
-        # Short relax: vertices far from the SW defect have ~zero gradient and
-        # don't move, so this acts as a local relaxation while letting L-BFGS
-        # propagate as far as the energy landscape demands.
+        # Vink/Mousseau-Barkema local relax: only vertices within
+        # `local_shell_depth` graph-edge hops of the SW seed {i, c, j, d} are
+        # allowed to move. Out-of-shell vertices are held fixed via gradient
+        # masking. Setting `local_shell_depth=None` falls back to the old
+        # full-N relaxation (kept for diagnostics, not recommended).
+        if local_shell_depth is not None and local_shell_depth > 0:
+            seed_verts = np.array([sw_i, sw_c, sw_j, sw_d], dtype=np.int64)
+            shell = compute_local_shell_mask(seed_verts, neighbors,
+                                             local_shell_depth, N)
+            ctx.set_moving_mask(shell)
+        else:
+            ctx.set_moving_mask(None)
+
         new_pos, E_new = relax(positions, ctx, max_iter=relax_local_iters)
 
         dE = E_new - E_curr
@@ -919,8 +1016,9 @@ def www_anneal(
             ctx.update_topology(edges, neighbors)
             positions = pos_before
 
-        # Periodic global relax
+        # Periodic global relax — full-network polish (no shell mask).
         if relax_global_every > 0 and (it + 1) % relax_global_every == 0:
+            ctx.set_moving_mask(None)
             positions, E_curr = relax(positions, ctx,
                                       max_iter=relax_global_iters)
             # L-BFGS preserves energy under global PBC translation, so
@@ -1289,6 +1387,7 @@ def generate_lsu_network(
     relax_global_every: int = 200,
     relax_local_iters: int = 100,
     relax_global_iters: int = 500,
+    local_shell_depth: Optional[int] = 4,
     seed: int = 42,
     use_jax: Optional[bool] = None,
     use_jaxopt: bool = False,
@@ -1338,6 +1437,15 @@ def generate_lsu_network(
         ~80 effectively prevent phi from rising regardless of iteration count.
     relax_global_iters : int
         L-BFGS-B iteration cap for the global relaxation (default 500).
+    local_shell_depth : int or None
+        Depth (in graph edges) of the moving shell around each Stone-Wales
+        defect. Vertices farther than this are held fixed during the post-SW
+        relaxation. Default 4, matching the Vink/Mousseau-Barkema scheme that
+        Sellers's supplement (Methods, refs [13,14]) cites. Set to ``None`` or
+        0 to disable shell masking and run a full-N L-BFGS for every relax
+        (the previous behaviour; produces corner/edge void clustering at high
+        iteration counts because vertices anywhere in the cell can drift
+        toward each other under the bonded-only Sellers energy).
     seed : int
         Random seed for reproducibility.
     use_jax : bool, optional
@@ -1438,6 +1546,7 @@ def generate_lsu_network(
         relax_local_iters=relax_local_iters,
         relax_global_iters=relax_global_iters,
         relax_global_every=relax_global_every,
+        local_shell_depth=local_shell_depth,
         check_lsu_every=check_lsu_every,
         use_jax=use_jax, use_jaxopt=use_jaxopt_eff, verbose=verbose,
     )

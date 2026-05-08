@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import math
 import time
+import warnings
 from itertools import permutations
 from typing import Dict, Optional, Tuple, Union
 
@@ -130,11 +131,65 @@ def poisson_disk_pbc(
     return positions
 
 
+def _f1_relax_inplace(
+    positions: np.ndarray,
+    edges: np.ndarray,
+    box: np.ndarray,
+    d0: float,
+    max_iter: int = 100,
+) -> np.ndarray:
+    """L-BFGS-B on f1 = Σ_(i,j) (|r_ij| - d0)² with PBC, pure NumPy gradient.
+
+    Used between Stage A (Hamiltonian-like cycle) and Stage B (chord
+    matching) of `_build_trivalent_proximity_graph` to tighten the cycle
+    bonds toward d0 *before* Stage B picks chords. After Stage A every
+    vertex is degree-2 in a single folded cycle whose bonds extend up to
+    `r_cut` (≈ 1.7·d0); pre-relaxing the cycle moves vertices by ~0.3·d0
+    and lets Stage B's nearest-pair pick on the new distance matrix
+    avoid the long stragglers that otherwise produce 4–5·d0 chord
+    bonds at low density (verified at N=1000 / L=11.44 / d0=0.8).
+
+    Modifies and returns `positions` (also returned for chaining).
+    """
+    box = np.asarray(box, dtype=np.float64).reshape(3)
+    N = positions.shape[0]
+    edges_i = edges[:, 0]
+    edges_j = edges[:, 1]
+
+    def fun_and_grad(x: np.ndarray) -> Tuple[float, np.ndarray]:
+        pos = x.reshape(N, 3)
+        diff = pos[edges_j] - pos[edges_i]
+        diff -= box * np.round(diff / box)
+        L2 = np.sum(diff * diff, axis=1)
+        L = np.sqrt(np.maximum(L2, 1e-24))
+        dev = L - d0
+        f = float(np.sum(dev * dev))
+        unit = diff / L[:, None]
+        F = (2.0 * dev)[:, None] * unit
+        g = np.zeros((N, 3), dtype=np.float64)
+        np.add.at(g, edges_i, -F)
+        np.add.at(g, edges_j, +F)
+        return f, g.reshape(-1)
+
+    res = minimize(
+        fun_and_grad, positions.reshape(-1).astype(np.float64),
+        jac=True, method="L-BFGS-B",
+        options={"maxiter": max_iter, "gtol": 1e-6, "ftol": 1e-9},
+    )
+    pos_out = res.x.reshape(N, 3)
+    pos_out -= box * np.round(pos_out / box)
+    positions[:] = pos_out
+    return positions
+
+
 def _build_trivalent_proximity_graph(
     positions: np.ndarray,
     box: np.ndarray,
     r_cut: float,
     rng: np.random.Generator,
+    max_chord_length: float = float("inf"),
+    pre_relax_d0: Optional[float] = None,
+    pre_relax_iters: int = 100,
 ) -> Optional[np.ndarray]:
     """Build a 3-regular edge set on `positions` using BM-style proximity bonds.
 
@@ -150,9 +205,22 @@ def _build_trivalent_proximity_graph(
         (A, B), (A, C). This is the BM elementary move (their Fig. 1)
         for the +1-edge step. A goes from deg 0 to deg 2; B, C stay at 2.
 
+    Stage A.5 (optional) — Cycle pre-relax (``pre_relax_d0`` not None):
+      - L-BFGS on f1 (bond stretch) over the deg-2 Hamiltonian cycle, so
+        cycle bonds settle toward d0 *before* Stage B picks chords. Moves
+        vertices by ~0.3·d0 typically. At low density (N=1000 / L=11.44
+        / d0=0.8) this reduces Stage B's worst chord by pulling otherwise
+        isolated cycle-stragglers closer to a chord partner. Pure-NumPy
+        scipy.minimize, ~50 ms for N=1000.
+
     Stage B — Chord matching (every vertex at deg = 3):
       - Repeatedly add the shortest available edge between two vertices
-        both still at deg 2 that are not already bonded.
+        both still at deg 2 that are not already bonded. Reject (return
+        None) if the shortest available chord exceeds ``max_chord_length``
+        — this prevents a sparse handful of deg-2 stragglers from being
+        bonded across the cell, which would leave a multi-d0 bond that
+        the initial L-BFGS relax can only shrink by dragging vertices
+        together (a void-drift mechanism).
 
     Returns the edge array (E, 2) on success or None if the cutoff is too
     tight (caller should widen r_cut and retry).
@@ -250,6 +318,24 @@ def _build_trivalent_proximity_graph(
         add_edge(A, B); add_edge(A, C)
         inserted[A] = True
 
+    # ===== Stage A.5: optional f1 pre-relax of the deg-2 cycle =====
+    # Tightens cycle bonds toward d0 *before* Stage B selects chords on
+    # the resulting positions. Without this the deg-2 cycle bonds extend
+    # up to r_cut (≈ 1.7·d0), leaving cycle-folding artefacts that force
+    # Stage B to bridge isolated stragglers across the cell. Recompute
+    # the (N, N) distance matrix afterwards so Stage B uses the relaxed
+    # geometry.
+    if pre_relax_d0 is not None:
+        cycle_edges = np.fromiter(
+            (idx for ab in edge_set for idx in ab),
+            dtype=np.int64, count=2 * len(edge_set),
+        ).reshape(-1, 2)
+        _f1_relax_inplace(positions, cycle_edges, box, pre_relax_d0,
+                          max_iter=pre_relax_iters)
+        diff = positions[:, None, :] - positions[None, :, :]
+        diff -= box * np.round(diff / box)
+        dists = np.linalg.norm(diff, axis=-1)
+
     # ===== Stage B: chord matching to deg = 3 =====
     # Per-iteration: argmin on the (|D2|, |D2|) submatrix of `dists` masked
     # by the (|D2|, |D2|) sub-block of `adj`. Vectorised — no Python loops
@@ -266,6 +352,8 @@ def _build_trivalent_proximity_graph(
         ii, jj = divmod(flat, deg2_idx.size)
         if not np.isfinite(sub[ii, jj]):
             return None
+        if sub[ii, jj] > max_chord_length:
+            return None
         i, j = int(deg2_idx[ii]), int(deg2_idx[jj])
         add_edge(i, j)
 
@@ -280,9 +368,12 @@ def bm_initial_network(
     rng: np.random.Generator,
     r_min_ratio: float = 0.7,
     r_cut_ratio: float = 1.7,
-    layouts_per_cutoff: int = 4,
-    max_cutoff_widenings: int = 8,
+    layouts_per_cutoff: int = 8,
+    max_cutoff_widenings: int = 12,
     r_cut_widen: float = 1.08,
+    stage_b_max_ratio: float = float("inf"),
+    pre_relax_stage_a: bool = False,
+    pre_relax_iters: int = 100,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Barkema-Mousseau-style random initial trivalent network.
 
@@ -298,6 +389,20 @@ def bm_initial_network(
     over a permissive cutoff, since widening the cutoff lets repair
     edges bridge long distances.
 
+    Stage B (chord matching) caps individual chord lengths at
+    ``stage_b_max_ratio * d0``. **Default ``float('inf')`` (off)** — at
+    the Sellers reference density (N=1000, L=11.44, d0=0.8 ≈ 0.67
+    verts/µm³) the natural Stage B chord distribution has a long tail
+    (max ≈ 4–5·d0) and tighter caps (≤3·d0) failed all 96 retries. Use
+    finite values only at higher density (≳1.0 verts/µm³) where the cap
+    has measurable effect (verified at N=200 / L=5.4 / d0=0.8: cap=2.5
+    drops max from ~2.9·d0 to ~2.5·d0). For low-density configurations,
+    long seed bonds will instead be pulled in by the start-of-run
+    L-BFGS, which under the bonded-only Sellers energy can drag vertices
+    across the cell and seed void clustering before WWW starts; the
+    documented mitigation is to bypass the BM seeder entirely (use the
+    Sellers reference file as the starting topology — feature deferred).
+
     Returns
     -------
     positions : (N, 3) float64
@@ -309,8 +414,9 @@ def bm_initial_network(
     ------
     RuntimeError
         If a connected 3-regular network cannot be built within the attempt
-        budget. Either lower the density (raise box size) or raise
-        ``r_cut_ratio``.
+        budget. Either lower the density (raise box size), raise
+        ``r_cut_ratio``, or relax ``stage_b_max_ratio`` (a value of
+        ``float('inf')`` recovers the pre-2026-05-07 behaviour).
     """
     if N < 4 or N % 2 != 0:
         raise ValueError(f"N must be even and >= 4, got {N}")
@@ -318,6 +424,7 @@ def bm_initial_network(
     box_arr = coerce_box(box)
     r_min = r_min_ratio * d0
     r_cut = r_cut_ratio * d0
+    max_chord = stage_b_max_ratio * d0
 
     last_err = None
     for widen_step in range(max_cutoff_widenings):
@@ -328,7 +435,12 @@ def bm_initial_network(
                 r_min *= 0.95
                 last_err = e
                 continue
-            edges = _build_trivalent_proximity_graph(positions, box_arr, r_cut, rng)
+            edges = _build_trivalent_proximity_graph(
+                positions, box_arr, r_cut, rng,
+                max_chord_length=max_chord,
+                pre_relax_d0=d0 if pre_relax_stage_a else None,
+                pre_relax_iters=pre_relax_iters,
+            )
             if edges is None:
                 continue
             if not is_connected(N, edges):
@@ -339,7 +451,8 @@ def bm_initial_network(
         f"bm_initial_network: failed after {max_cutoff_widenings} cutoff "
         f"widenings × {layouts_per_cutoff} layouts (N={N}, "
         f"box={box_arr.tolist()}, d0={d0}, final r_min={r_min:.4g}, "
-        f"r_cut={r_cut:.4g}). Last placement error: {last_err}"
+        f"r_cut={r_cut:.4g}, stage_b_max={max_chord:.4g}). "
+        f"Last placement error: {last_err}"
     )
 
 
@@ -947,7 +1060,8 @@ def www_anneal(
     target_tolerance: float = 0.005,
     relax_local_iters: int = 100,
     relax_global_iters: int = 500,
-    relax_global_every: int = 200,
+    relax_global_every: int = 0,
+    global_fallback_threshold: float = float("inf"),
     local_shell_depth: Optional[int] = 4,
     check_lsu_every: int = 500,
     use_jax: bool = False,
@@ -955,16 +1069,40 @@ def www_anneal(
     verbose: bool = True,
 ):
     """Run WWW simulated annealing. Returns (positions, edges, neighbors, history).
+
+    Sellers's supplement (Methods, refs [13,14]) follows Vink/Mousseau-Barkema:
+    spatially-local L-BFGS within the SW shell each move, with full-N L-BFGS
+    only as a *rare fallback* when the local relax fails. The shell-constrained
+    relax leaves residual ΔE > 0 for many "good" moves (frozen vertices outside
+    the shell can't fully accommodate the new topology), so a 0-threshold gate
+    would fire on essentially every uphill move and re-introduce the same
+    full-N drift it is meant to suppress. Default ``float('inf')`` keeps the
+    gate off; set a finite value (e.g. 5.0–20.0 in typical energy units) to
+    promote the worst-stalled moves to a global polish. The legacy fixed-
+    schedule polish ``relax_global_every`` is kept only for back-compat and
+    is no-op when set to 0 (the new default); a non-zero value emits a
+    deprecation warning.
     """
+    if relax_global_every:
+        warnings.warn(
+            "`relax_global_every` runs an unconditional full-N L-BFGS that "
+            "re-introduces void clustering under the bonded-only Sellers "
+            "energy. The Vink/Mousseau-Barkema scheme uses fallback-gated "
+            "global relax instead — set `relax_global_every=0` and tune "
+            "`global_fallback_threshold` (default 0.0).",
+            DeprecationWarning, stacklevel=2,
+        )
+
     N = positions.shape[0]
     ctx = _RelaxContext(N, box, d0, weights, use_jax=use_jax, use_jaxopt=use_jaxopt)
     ctx.update_topology(edges, neighbors)
     E_curr = ctx.energy(positions.reshape(-1))
     history = {"iter": [], "T": [], "E": [], "lsu": [], "accepted": 0,
-               "proposed": 0}
+               "proposed": 0, "global_fallbacks": 0}
 
     accepted = 0
     proposed = 0
+    fallback_count = 0
     log_ratio = math.log(T_final / T0) if T0 > 0 else 0.0
     t_start = time.time()
 
@@ -1003,9 +1141,25 @@ def www_anneal(
             ctx.set_moving_mask(None)
 
         new_pos, E_new = relax(positions, ctx, max_iter=relax_local_iters)
-
         dE = E_new - E_curr
-        # Metropolis acceptance
+
+        # Vink/Mousseau-Barkema fallback gate: if the local-shell relax
+        # failed to lower the energy by at least `global_fallback_threshold`,
+        # promote this single move to a full-N polish before deciding to
+        # accept. Replaces the previous fixed-schedule global polish, which
+        # under the bonded-only Sellers energy let vertices drift toward
+        # each other every K iterations and re-introduced void clustering.
+        if dE > global_fallback_threshold:
+            ctx.set_moving_mask(None)
+            new_pos, E_new = relax(new_pos, ctx, max_iter=relax_global_iters)
+            # L-BFGS preserves energy under global PBC translation, so
+            # positions can drift outside [-L/2, L/2]^3. Wrap back into the
+            # canonical box (idempotent).
+            new_pos = new_pos - box * np.round(new_pos / box)
+            dE = E_new - E_curr
+            fallback_count += 1
+
+        # Metropolis acceptance on the (possibly fallback-improved) ΔE.
         if dE <= 0 or rng.random() < math.exp(-dE / max(T, 1e-12)):
             positions = new_pos
             E_curr = E_new
@@ -1015,17 +1169,6 @@ def www_anneal(
             stone_wales_revert(edges, neighbors, move)
             ctx.update_topology(edges, neighbors)
             positions = pos_before
-
-        # Periodic global relax — full-network polish (no shell mask).
-        if relax_global_every > 0 and (it + 1) % relax_global_every == 0:
-            ctx.set_moving_mask(None)
-            positions, E_curr = relax(positions, ctx,
-                                      max_iter=relax_global_iters)
-            # L-BFGS preserves energy under global PBC translation, so
-            # positions can drift outside [-L/2, L/2]^3 over many iterations.
-            # Wrap back into the canonical box; this is idempotent and keeps
-            # downstream rod-export visualisation centred on the unit cell.
-            positions = positions - box * np.round(positions / box)
 
         # Periodic LSU check + early exit
         if check_lsu_every > 0 and (it + 1) % check_lsu_every == 0:
@@ -1040,10 +1183,11 @@ def www_anneal(
             history["lsu"].append(phi)
             if verbose:
                 acc_rate = accepted / max(1, proposed)
+                fb_rate = fallback_count / max(1, proposed)
                 print(
                     f"[WWW it={it+1:6d}] T={T:.4g}  E={E_curr:.4g}  "
                     f"phi_{target_depth}{target_locality}={phi:.4f}  "
-                    f"acc={acc_rate:.2%}  "
+                    f"acc={acc_rate:.2%}  fb={fb_rate:.2%}  "
                     f"elapsed={time.time()-t_start:.1f}s"
                 )
             if verbose and (it + 1) == check_lsu_every:
@@ -1066,6 +1210,7 @@ def www_anneal(
 
     history["accepted"] = accepted
     history["proposed"] = proposed
+    history["global_fallbacks"] = fallback_count
     return positions, edges, neighbors, history
 
 
@@ -1466,9 +1611,10 @@ def generate_lsu_network(
     energy_weights: Optional[Dict[str, float]] = None,
     target_tolerance: float = 0.01,
     check_lsu_every: int = 500,
-    relax_global_every: int = 200,
+    relax_global_every: int = 0,
     relax_local_iters: int = 100,
     relax_global_iters: int = 500,
+    global_fallback_threshold: float = float("inf"),
     local_shell_depth: Optional[int] = 4,
     seed: int = 42,
     use_jax: Optional[bool] = None,
@@ -1518,10 +1664,14 @@ def generate_lsu_network(
     check_lsu_every : int
         How often (in WWW iterations) to measure the current LSU.
     relax_global_every : int
-        How often to perform a full L-BFGS-B relaxation (default 200).
-        Frequent global polishes keep the system near its geometric local
-        minimum so that ΔE between accepted moves reflects topology quality
-        rather than residual geometric strain.
+        **Deprecated, default 0.** Legacy fixed-schedule full-N L-BFGS polish.
+        With the bonded-only Sellers energy this re-introduces void clustering
+        because vertices anywhere in the cell can drift toward each other every
+        K iterations. The Vink/Mousseau-Barkema scheme used by Sellers's cited
+        refs [13,14] runs global relax only as a fallback when local relax
+        fails to lower energy — see ``global_fallback_threshold``. Setting
+        a non-zero value emits a ``DeprecationWarning``; behaviour is also
+        retained as no-op (it is **not** wired back into the loop).
     relax_local_iters : int
         L-BFGS-B iteration cap for the local relaxation after each SW move
         (default 100). **Critical for convergence**: benchmarking on N=1102
@@ -1529,7 +1679,19 @@ def generate_lsu_network(
         crosses into negative territory between 30 and 100 iters. Values below
         ~80 effectively prevent phi from rising regardless of iteration count.
     relax_global_iters : int
-        L-BFGS-B iteration cap for the global relaxation (default 500).
+        L-BFGS-B iteration cap for each fallback full-N polish (default 500).
+        Used when the per-move local relax fails the
+        ``global_fallback_threshold`` check.
+    global_fallback_threshold : float
+        Energy increase ΔE = E_new - E_curr above which a single full-N L-BFGS
+        polish is run on the post-SW positions before the Metropolis decision.
+        Default ``float('inf')`` (off). Lower to a finite value to enable the
+        Vink/Mousseau-Barkema fallback. Pick the threshold large enough that
+        only "stalled" local relaxes trigger it: shell-constrained relax
+        leaves residual ΔE > 0 even for good moves, so a value below the
+        typical post-shell residual fires on every uphill move and
+        re-introduces the void drift this gate is meant to avoid. Reasonable
+        starting values are 5.0–20.0 in the same units as the energy.
     local_shell_depth : int or None
         Depth (in graph edges) of the moving shell around each Stone-Wales
         defect. Vertices farther than this are held fixed during the post-SW
@@ -1672,16 +1834,21 @@ def generate_lsu_network(
         relax_local_iters=relax_local_iters,
         relax_global_iters=relax_global_iters,
         relax_global_every=relax_global_every,
+        global_fallback_threshold=global_fallback_threshold,
         local_shell_depth=local_shell_depth,
         check_lsu_every=check_lsu_every,
         use_jax=use_jax, use_jaxopt=use_jaxopt_eff, verbose=verbose,
     )
 
-    # Final clean-up: full relaxation
+    # Final clean-up: one short full-N polish to settle bond-length residual.
+    # Capped at min(relax_local_iters, 50) — long polishes here re-introduce
+    # the same void drift mechanism the WWW fallback gate suppresses, so we
+    # keep this brief.
     final_ctx = _RelaxContext(N, box, edge_length, weights,
                               use_jax=use_jax, use_jaxopt=use_jaxopt_eff)
     final_ctx.update_topology(edges, neighbors)
-    positions, _ = relax(positions, final_ctx, max_iter=relax_global_iters * 2)
+    positions, _ = relax(positions, final_ctx,
+                         max_iter=min(relax_local_iters, 50))
     positions = positions - box * np.round(positions / box)
 
     # Connectivity sanity check

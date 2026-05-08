@@ -1,4 +1,4 @@
 - [User role](user_role.md) — PhD student building photonic LSU networks; knows the literature, addresses by ref number.
-- [LSU known issues](project_known_issues.md) — void clustering root cause is full-N L-BFGS deviating from Sellers-cited Vink/MB local-shell relax; bond-collapse secondary; jaxopt slower than scipy+JIT on CPU.
+- [LSU known issues](project_known_issues.md) — void clustering needs BOTH local-shell mask AND fallback-gated global polish (default off via `global_fallback_threshold=inf`); fixed-schedule `relax_global_every` deprecated; bond-collapse secondary.
 - [LSU literature anchors](reference_lsu_literature.md) — no published {α,β,γ,δ} for Sellers four-term U; Sellers cites Vink/MB 2001 for relax refinements (4-shell local); Hemmann/Saba 2026 has no non-bonded vertex repulsion (corrected); Si Keating β/α≈0.285.
 - [Rod count convention](project_rod_count_convention.md) — reference file is N=1000/E=1500 with 153 PBC-image duplicates (1653 lines); use `num_vertices=1000` to match; `pbc_duplicate_boundary_rods=True` default required for downstream periodicity.

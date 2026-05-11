@@ -5,34 +5,32 @@
    we also call `jax.config.update("jax_enable_x64", True)` so L-BFGS-B sees
    float64 gradients.
 2. **PBC helpers** — `pbc_displacement`, `coerce_box`.
-3. **Topology** —
-   - `poisson_disk_pbc` — hard-core uniform vertex placement under PBC
-     (Barkema-Mousseau §II.A, the placement step).
-   - `_build_trivalent_proximity_graph` — Stage A + Stage B builder (see
-     `algorithm.md` §1.5). Stage A loop-expansion is the BM "+1 edge" move
-     adapted for trivalent (single-visit Hamiltonian cycle); Stage B is the
-     chord matching. Both stages are vectorised over a (|R|, |E|) cost
-     matrix and a (|D2|, |D2|) chord matrix using a precomputed (N, N)
-     boolean adjacency matrix `adj` — no Python loops over neighbour sets.
-     Cost: ~22 s for N=1102 on CPU, dominated by Stage A's per-iteration
-     fancy-indexing of `dists`. Both stages have fallbacks that allow
-     longer-than-`r_cut` bonds rather than failing — the WWW relaxation
-     then pulls them in.
-   - `bm_initial_network` — outer wrapper that returns `(positions, edges)` for
-     a connected, simple, 3-regular network with seed bonds clustered around
-     `d0`. **This is the seed used by `generate_lsu_network`.**
-   - `random_3regular_graph` — configuration model with rejection. Retained for
-     reference / tests; **not used** in the default code path.
-   - `is_connected` — BFS connectivity check.
-   - `build_neighbors` — edge list → (N,3) neighbor index array.
-   - `build_angle_triples`, `build_dihedral_quads` — index arrays for f2 / f3+f4.
-4. **Energy** —
+3. **Graph helpers** — `is_connected` (BFS), `build_neighbors`
+   (edge list → (N,3) neighbour array).
+4. **Crystalline Z=3 seed** —
+   - `_LATTICE_LIBRARY` — dict of named periodic Z=3 networks. Each entry
+     has `sites_frac`, `bonds` (with PBC offsets), `cell_aspect`,
+     `target_bond_frac`, `vertices_per_cell`. Default: `'diamond3'` —
+     cubic diamond minus a 4-bond perfect matching (8 vertices/cubic
+     cell, all bonds length `a·sqrt(3)/4`).
+   - `_pick_tile_dims` — picks (nx, ny, nz) so total N matches the request
+     (or warns and rounds; raises with `strict_tiling=True`).
+   - `crystal_seed_network` — tiles the lattice, applies Gaussian
+     position jitter, asserts Z=3 + 3D connectivity invariants.
+     Returns `(positions, edges, meta)`. **This is the seed used by
+     `generate_lsu_network`.** See `algorithm.md` §1.5 for the literature
+     grounding (Hemmann/Saba 2026).
+   - `_voxel_density_std` — 4^3 voxel density std used by the burn-in
+     plateau detector. Reference network ~2.79.
+5. **Topology helpers** — `compute_local_shell_mask`,
+   `build_angle_triples`, `build_dihedral_quads`.
+6. **Energy** —
    - `total_energy(...)` — NumPy scalar U via vectorized ops (f1+f2+f3+f4).
    - `_energy_jax_full(...)` — same but in JAX, autodiffed and JIT-compiled.
    - `_value_and_grad_jit` — single module-level JIT'd value-and-gradient,
      keyed on shape. Shapes are invariant under Stone-Wales (n_edges, n_triples,
      n_quads stay constant), so JAX compiles **once** per (N, E) and reuses.
-5. **Relaxation** —
+7. **Relaxation** —
    - `_RelaxContext` — caches device-side topology arrays and binds them to
      the JIT'd kernel. After a Stone-Wales move the WWW loop calls
      `ctx.update_topology(edges, neighbors)` to refresh the index arrays
@@ -63,14 +61,18 @@
    Scipy + JIT scales linearly with N; jaxopt's per-call dispatch
    overhead is ~2 s regardless of size, so it loses by 50–150× on CPU at
    every scale. jaxopt is only worth turning on for GPU runs.
-6. **Stone-Wales** —
+8. **Stone-Wales** —
    - `stone_wales_propose(neighbors, edges, rng)` — select valid bond switch.
    - `stone_wales_apply(...)` / `stone_wales_revert(...)`.
-7. **WWW main loop** —
+9. **WWW main loop** —
    - `www_anneal(positions, neighbors, edges, box, ...)` — Metropolis loop with
      geometric temperature schedule and periodic full relaxations. Uses one
      long-lived `_RelaxContext`.
-8. **LSU computation** —
+   - `topology_burn_in(...)` — thin wrapper over `www_anneal` with constant T
+     and no LSU target. Auto-calibrates T via a probe sweep to ~70% acceptance.
+     Stops early when the 4^3-voxel-density std plateaus. Run before the
+     production WWW loop to destroy crystalline memory of the seed.
+10. **LSU computation** —
    - `_build_tree(vertex, depth, neighbors, positions, box)` — BFS to depth n,
      storing edge vectors in unwrapped local frame.
    - `_phi_for_permutation(...)` — Eq. 3 score for one root-edge permutation
@@ -78,14 +80,14 @@
    - `phi_ab(tree_a, tree_b)` — average over all γ! permutations (Eq. 1).
    - `compute_lsu(positions, neighbors, edges, box, depth, locality, sample)`
      — average ϕ over (a,b) pairs.
-9. **Output formatting** — `network_to_rods(positions, edges, box,
+11. **Output formatting** — `network_to_rods(positions, edges, box,
    pbc_duplicate_boundary_rods=True)`. With duplication on (default) each
    face-crossing edge is emitted twice — once anchored at each canonical-box
    endpoint — matching the Sellers reference convention and producing a
    periodic permittivity grid downstream. `pbc_duplicate_boundary_rods=False`
    gives one row per unique edge (legacy behaviour, kept for callers that
    PBC-tile downstream themselves).
-10. **Public entry point** — `generate_lsu_network(...)`.
+12. **Public entry point** — `generate_lsu_network(...)`.
 
 ## Performance (measured, Windows 11, CPU only)
 Benchmark: 60 rods / 40 vertices, 300 WWW iterations, identical seed.

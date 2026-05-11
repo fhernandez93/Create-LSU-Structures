@@ -75,430 +75,6 @@ def pbc_displacement(d: np.ndarray, box: np.ndarray) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 # Topology — random 3-regular graph
 # --------------------------------------------------------------------------- #
-def poisson_disk_pbc(
-    N: int,
-    box: np.ndarray,
-    r_min: float,
-    rng: np.random.Generator,
-    soften_factor: float = 0.95,
-    soften_after_failures: int = 200,
-    max_total_tries: Optional[int] = None,
-) -> np.ndarray:
-    """Random hard-core sampling of N points in a periodic box.
-
-    Implements the placement step of Barkema & Mousseau (PRB 62, 4985, 2000)
-    section II.A: uniform random positions in [-L/2, L/2]^3 (PBC) with the
-    minimum-image distance between any two points constrained to be >= r_min.
-    If rejection rate becomes pathological the constraint is softened by
-    `soften_factor`, mirroring BM's tolerance to a few too-close pairs in
-    the seed configuration.
-    """
-    box = np.asarray(box, dtype=np.float64).reshape(3)
-    half = box / 2.0
-    if max_total_tries is None:
-        max_total_tries = N * 2000
-
-    positions = np.empty((N, 3), dtype=np.float64)
-    placed = 0
-    r_min_curr = float(r_min)
-    consecutive_failures = 0
-    total_tries = 0
-
-    while placed < N and total_tries < max_total_tries:
-        candidate = rng.uniform(-half, half)
-        total_tries += 1
-        if placed == 0:
-            positions[0] = candidate
-            placed = 1
-            continue
-        diff = candidate - positions[:placed]
-        diff -= box * np.round(diff / box)
-        if np.min(np.linalg.norm(diff, axis=1)) >= r_min_curr:
-            positions[placed] = candidate
-            placed += 1
-            consecutive_failures = 0
-        else:
-            consecutive_failures += 1
-            if consecutive_failures >= soften_after_failures:
-                r_min_curr *= soften_factor
-                consecutive_failures = 0
-
-    if placed < N:
-        raise RuntimeError(
-            f"poisson_disk_pbc: placed only {placed}/{N} after {total_tries} "
-            f"tries (final r_min={r_min_curr:.4g}, initial {r_min:.4g})."
-        )
-    return positions
-
-
-def _f1_relax_inplace(
-    positions: np.ndarray,
-    edges: np.ndarray,
-    box: np.ndarray,
-    d0: float,
-    max_iter: int = 100,
-) -> np.ndarray:
-    """L-BFGS-B on f1 = Σ_(i,j) (|r_ij| - d0)² with PBC, pure NumPy gradient.
-
-    Used between Stage A (Hamiltonian-like cycle) and Stage B (chord
-    matching) of `_build_trivalent_proximity_graph` to tighten the cycle
-    bonds toward d0 *before* Stage B picks chords. After Stage A every
-    vertex is degree-2 in a single folded cycle whose bonds extend up to
-    `r_cut` (≈ 1.7·d0); pre-relaxing the cycle moves vertices by ~0.3·d0
-    and lets Stage B's nearest-pair pick on the new distance matrix
-    avoid the long stragglers that otherwise produce 4–5·d0 chord
-    bonds at low density (verified at N=1000 / L=11.44 / d0=0.8).
-
-    Modifies and returns `positions` (also returned for chaining).
-    """
-    box = np.asarray(box, dtype=np.float64).reshape(3)
-    N = positions.shape[0]
-    edges_i = edges[:, 0]
-    edges_j = edges[:, 1]
-
-    def fun_and_grad(x: np.ndarray) -> Tuple[float, np.ndarray]:
-        pos = x.reshape(N, 3)
-        diff = pos[edges_j] - pos[edges_i]
-        diff -= box * np.round(diff / box)
-        L2 = np.sum(diff * diff, axis=1)
-        L = np.sqrt(np.maximum(L2, 1e-24))
-        dev = L - d0
-        f = float(np.sum(dev * dev))
-        unit = diff / L[:, None]
-        F = (2.0 * dev)[:, None] * unit
-        g = np.zeros((N, 3), dtype=np.float64)
-        np.add.at(g, edges_i, -F)
-        np.add.at(g, edges_j, +F)
-        return f, g.reshape(-1)
-
-    res = minimize(
-        fun_and_grad, positions.reshape(-1).astype(np.float64),
-        jac=True, method="L-BFGS-B",
-        options={"maxiter": max_iter, "gtol": 1e-6, "ftol": 1e-9},
-    )
-    pos_out = res.x.reshape(N, 3)
-    pos_out -= box * np.round(pos_out / box)
-    positions[:] = pos_out
-    return positions
-
-
-def _build_trivalent_proximity_graph(
-    positions: np.ndarray,
-    box: np.ndarray,
-    r_cut: float,
-    rng: np.random.Generator,
-    max_chord_length: float = float("inf"),
-    pre_relax_d0: Optional[float] = None,
-    pre_relax_iters: int = 100,
-) -> Optional[np.ndarray]:
-    """Build a 3-regular edge set on `positions` using BM-style proximity bonds.
-
-    Adapted from Barkema-Mousseau (PRB 62, 4985, 2000) §II.A, which targets
-    tetravalent (Si) networks via a single loop visiting each atom twice.
-    For our trivalent (γ = 3) case the loop visits each atom once and we
-    add a chord matching to lift degree from 2 to 3.
-
-    Stage A — Hamiltonian-like cycle (every vertex at deg = 2):
-      - Seed with a triangle of 3 mutually-close vertices.
-      - Iteratively insert an unbonded vertex A into an existing edge
-        (B, C) when dist(A,B), dist(A,C) ≤ r_cut: remove (B, C), add
-        (A, B), (A, C). This is the BM elementary move (their Fig. 1)
-        for the +1-edge step. A goes from deg 0 to deg 2; B, C stay at 2.
-
-    Stage A.5 (optional) — Cycle pre-relax (``pre_relax_d0`` not None):
-      - L-BFGS on f1 (bond stretch) over the deg-2 Hamiltonian cycle, so
-        cycle bonds settle toward d0 *before* Stage B picks chords. Moves
-        vertices by ~0.3·d0 typically. At low density (N=1000 / L=11.44
-        / d0=0.8) this reduces Stage B's worst chord by pulling otherwise
-        isolated cycle-stragglers closer to a chord partner. Pure-NumPy
-        scipy.minimize, ~50 ms for N=1000.
-
-    Stage B — Chord matching (every vertex at deg = 3):
-      - Repeatedly add the shortest available edge between two vertices
-        both still at deg 2 that are not already bonded. Reject (return
-        None) if the shortest available chord exceeds ``max_chord_length``
-        — this prevents a sparse handful of deg-2 stragglers from being
-        bonded across the cell, which would leave a multi-d0 bond that
-        the initial L-BFGS relax can only shrink by dragging vertices
-        together (a void-drift mechanism).
-
-    Returns the edge array (E, 2) on success or None if the cutoff is too
-    tight (caller should widen r_cut and retry).
-    """
-    N = positions.shape[0]
-    box = np.asarray(box, dtype=np.float64).reshape(3)
-
-    diff = positions[:, None, :] - positions[None, :, :]
-    diff -= box * np.round(diff / box)
-    dists = np.linalg.norm(diff, axis=-1)
-
-    deg = np.zeros(N, dtype=np.int64)
-    adj = np.zeros((N, N), dtype=bool)
-    edge_set: set = set()  # (min(i,j), max(i,j))
-
-    def add_edge(i: int, j: int) -> None:
-        a, b = (i, j) if i < j else (j, i)
-        adj[i, j] = True; adj[j, i] = True
-        edge_set.add((a, b))
-        deg[i] += 1; deg[j] += 1
-
-    def remove_edge(i: int, j: int) -> None:
-        a, b = (i, j) if i < j else (j, i)
-        adj[i, j] = False; adj[j, i] = False
-        edge_set.discard((a, b))
-        deg[i] -= 1; deg[j] -= 1
-
-    # ===== Stage A: Hamiltonian-like cycle via BM loop expansion =====
-    # Seed: triangle of 3 mutually-close vertices.
-    iu, ju = np.triu_indices(N, k=1)
-    pair_d = dists[iu, ju]
-    seed_idx = int(np.argmin(pair_d))
-    i_seed, j_seed = int(iu[seed_idx]), int(ju[seed_idx])
-    score = np.maximum(dists[i_seed], dists[j_seed]).copy()
-    score[i_seed] = np.inf; score[j_seed] = np.inf
-    k_seed = int(np.argmin(score))
-    add_edge(i_seed, j_seed)
-    add_edge(j_seed, k_seed)
-    add_edge(k_seed, i_seed)
-
-    inserted = np.zeros(N, dtype=bool)
-    inserted[[i_seed, j_seed, k_seed]] = True
-
-    # Vectorised per-iteration: build (|R|, |E|) cost matrix, take argmin.
-    # Per-iter cost dominated by the (|R|, |E|) ≈ (N, 1.5N) numpy slice +
-    # fancy indexing (~milliseconds at N=10³). Falls back to a (|R|, N)
-    # nearest-pair scan when no standard insertion is available.
-    while not inserted.all():
-        remaining_arr = np.where(~inserted)[0]
-        edges_arr = np.fromiter(
-            (idx for ab in edge_set for idx in ab),
-            dtype=np.int64, count=2 * len(edge_set),
-        ).reshape(-1, 2)
-        B_arr = edges_arr[:, 0]; C_arr = edges_arr[:, 1]
-
-        d_to_B = dists[remaining_arr[:, None], B_arr[None, :]]
-        d_to_C = dists[remaining_arr[:, None], C_arr[None, :]]
-        d_BC = dists[B_arr, C_arr]
-        valid = (d_to_B < r_cut) & (d_to_C < r_cut)
-        valid &= (deg[B_arr] < 3)[None, :] & (deg[C_arr] < 3)[None, :]
-        valid &= ~adj[remaining_arr[:, None], B_arr[None, :]]
-        valid &= ~adj[remaining_arr[:, None], C_arr[None, :]]
-
-        cost = np.where(valid, d_to_B + d_to_C - d_BC[None, :], np.inf)
-        flat = int(np.argmin(cost))
-        i_r, j_e = divmod(flat, edges_arr.shape[0])
-        if np.isfinite(cost[i_r, j_e]):
-            A = int(remaining_arr[i_r])
-            B = int(B_arr[j_e]); C = int(C_arr[j_e])
-            remove_edge(B, C)
-            add_edge(A, B)
-            add_edge(A, C)
-            inserted[A] = True
-            continue
-
-        # Fallback: each remaining A picks its 2 nearest available
-        # neighbours (deg < 3, not already adjacent). May saturate those
-        # neighbours to deg 3 a step early; Stage B issues fewer chords.
-        d_R = dists[remaining_arr]
-        valid_n = (d_R < r_cut) & (d_R > 0)
-        valid_n &= (deg < 3)[None, :]
-        valid_n &= ~adj[remaining_arr]
-        masked_d = np.where(valid_n, d_R, np.inf)
-        if masked_d.shape[1] < 2:
-            return None
-        partn = np.argpartition(masked_d, 1, axis=1)[:, :2]
-        top2_d = np.take_along_axis(masked_d, partn, axis=1)
-        rows_invalid = ~np.isfinite(top2_d).all(axis=1)
-        costs = np.where(rows_invalid, np.inf, top2_d.sum(axis=1))
-        best_r = int(np.argmin(costs))
-        if not np.isfinite(costs[best_r]):
-            return None
-        A = int(remaining_arr[best_r])
-        B = int(partn[best_r, 0]); C = int(partn[best_r, 1])
-        add_edge(A, B); add_edge(A, C)
-        inserted[A] = True
-
-    # ===== Stage A.5: optional f1 pre-relax of the deg-2 cycle =====
-    # Tightens cycle bonds toward d0 *before* Stage B selects chords on
-    # the resulting positions. Without this the deg-2 cycle bonds extend
-    # up to r_cut (≈ 1.7·d0), leaving cycle-folding artefacts that force
-    # Stage B to bridge isolated stragglers across the cell. Recompute
-    # the (N, N) distance matrix afterwards so Stage B uses the relaxed
-    # geometry.
-    if pre_relax_d0 is not None:
-        cycle_edges = np.fromiter(
-            (idx for ab in edge_set for idx in ab),
-            dtype=np.int64, count=2 * len(edge_set),
-        ).reshape(-1, 2)
-        _f1_relax_inplace(positions, cycle_edges, box, pre_relax_d0,
-                          max_iter=pre_relax_iters)
-        diff = positions[:, None, :] - positions[None, :, :]
-        diff -= box * np.round(diff / box)
-        dists = np.linalg.norm(diff, axis=-1)
-
-    # ===== Stage B: chord matching to deg = 3 =====
-    # Per-iteration: argmin on the (|D2|, |D2|) submatrix of `dists` masked
-    # by the (|D2|, |D2|) sub-block of `adj`. Vectorised — no Python loops
-    # over neighbour sets.
-    while not np.all(deg == 3):
-        deg2_idx = np.where(deg == 2)[0]
-        if deg2_idx.size == 0:
-            break
-        sub = dists[np.ix_(deg2_idx, deg2_idx)].copy()
-        sub_adj = adj[np.ix_(deg2_idx, deg2_idx)]
-        np.fill_diagonal(sub, np.inf)
-        sub[sub_adj] = np.inf
-        flat = int(np.argmin(sub))
-        ii, jj = divmod(flat, deg2_idx.size)
-        if not np.isfinite(sub[ii, jj]):
-            return None
-        if sub[ii, jj] > max_chord_length:
-            return None
-        i, j = int(deg2_idx[ii]), int(deg2_idx[jj])
-        add_edge(i, j)
-
-    edges = np.array(sorted(edge_set), dtype=np.int64)
-    return edges
-
-
-def bm_initial_network(
-    N: int,
-    box: Union[float, Tuple[float, float, float], np.ndarray],
-    d0: float,
-    rng: np.random.Generator,
-    r_min_ratio: float = 0.7,
-    r_cut_ratio: float = 1.7,
-    layouts_per_cutoff: int = 8,
-    max_cutoff_widenings: int = 12,
-    r_cut_widen: float = 1.08,
-    stage_b_max_ratio: float = float("inf"),
-    pre_relax_stage_a: bool = False,
-    pre_relax_iters: int = 100,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Barkema-Mousseau-style random initial trivalent network.
-
-    Places `N` vertices uniformly inside the periodic cube under a hard-core
-    minimum separation `r_min = r_min_ratio * d0`, then builds a connected
-    3-regular graph whose edges connect physically nearby vertices using a
-    greedy nearest-neighbour pass plus BM loop-expansion repair (see
-    ``_build_trivalent_proximity_graph``).
-
-    For each candidate cutoff `r_cut` we try `layouts_per_cutoff` independent
-    Poisson-disk layouts before giving up and widening `r_cut`. This keeps
-    seed bonds short (close to `d0`) by preferring a fresh position draw
-    over a permissive cutoff, since widening the cutoff lets repair
-    edges bridge long distances.
-
-    Stage B (chord matching) caps individual chord lengths at
-    ``stage_b_max_ratio * d0``. **Default ``float('inf')`` (off)** — at
-    the Sellers reference density (N=1000, L=11.44, d0=0.8 ≈ 0.67
-    verts/µm³) the natural Stage B chord distribution has a long tail
-    (max ≈ 4–5·d0) and tighter caps (≤3·d0) failed all 96 retries. Use
-    finite values only at higher density (≳1.0 verts/µm³) where the cap
-    has measurable effect (verified at N=200 / L=5.4 / d0=0.8: cap=2.5
-    drops max from ~2.9·d0 to ~2.5·d0). For low-density configurations,
-    long seed bonds will instead be pulled in by the start-of-run
-    L-BFGS, which under the bonded-only Sellers energy can drag vertices
-    across the cell and seed void clustering before WWW starts; the
-    documented mitigation is to bypass the BM seeder entirely (use the
-    Sellers reference file as the starting topology — feature deferred).
-
-    Returns
-    -------
-    positions : (N, 3) float64
-        Vertex coordinates centred in [-L/2, L/2]^3.
-    edges : (E, 2) int64
-        Edge list with E = 3*N // 2.
-
-    Raises
-    ------
-    RuntimeError
-        If a connected 3-regular network cannot be built within the attempt
-        budget. Either lower the density (raise box size), raise
-        ``r_cut_ratio``, or relax ``stage_b_max_ratio`` (a value of
-        ``float('inf')`` recovers the pre-2026-05-07 behaviour).
-    """
-    if N < 4 or N % 2 != 0:
-        raise ValueError(f"N must be even and >= 4, got {N}")
-
-    box_arr = coerce_box(box)
-    r_min = r_min_ratio * d0
-    r_cut = r_cut_ratio * d0
-    max_chord = stage_b_max_ratio * d0
-
-    last_err = None
-    for widen_step in range(max_cutoff_widenings):
-        for layout in range(layouts_per_cutoff):
-            try:
-                positions = poisson_disk_pbc(N, box_arr, r_min, rng)
-            except RuntimeError as e:
-                r_min *= 0.95
-                last_err = e
-                continue
-            edges = _build_trivalent_proximity_graph(
-                positions, box_arr, r_cut, rng,
-                max_chord_length=max_chord,
-                pre_relax_d0=d0 if pre_relax_stage_a else None,
-                pre_relax_iters=pre_relax_iters,
-            )
-            if edges is None:
-                continue
-            if not is_connected(N, edges):
-                continue
-            return positions, edges
-        r_cut *= r_cut_widen
-    raise RuntimeError(
-        f"bm_initial_network: failed after {max_cutoff_widenings} cutoff "
-        f"widenings × {layouts_per_cutoff} layouts (N={N}, "
-        f"box={box_arr.tolist()}, d0={d0}, final r_min={r_min:.4g}, "
-        f"r_cut={r_cut:.4g}, stage_b_max={max_chord:.4g}). "
-        f"Last placement error: {last_err}"
-    )
-
-
-def random_3regular_graph(N: int, rng: np.random.Generator,
-                          max_attempts: int = 200) -> np.ndarray:
-    """Generate a connected simple 3-regular graph on N vertices.
-
-    Uses the configuration model with rejection: 3 stubs per vertex are
-    randomly paired; pairings producing a self-loop or a parallel edge are
-    discarded and the procedure restarts.
-
-    Note
-    ----
-    Retained for reference. ``generate_lsu_network`` no longer uses this
-    seed; it calls :func:`bm_initial_network`, which produces a seed with
-    short, proximity-correlated bonds (Barkema-Mousseau 2000).
-
-    Returns
-    -------
-    edges : (E, 2) int64 array  with E = 3*N // 2
-    """
-    if N < 4 or N % 2 != 0:
-        raise ValueError(f"N must be even and >= 4, got {N}")
-
-    for _ in range(max_attempts):
-        stubs = np.repeat(np.arange(N, dtype=np.int64), 3)
-        rng.shuffle(stubs)
-        edges = stubs.reshape(-1, 2)
-
-        # Reject self-loops
-        if np.any(edges[:, 0] == edges[:, 1]):
-            continue
-        # Reject parallel edges
-        canon = np.sort(edges, axis=1)
-        keys = canon[:, 0].astype(np.int64) * N + canon[:, 1]
-        if len(np.unique(keys)) != len(keys):
-            continue
-        # Connectivity
-        if is_connected(N, edges):
-            return edges
-    raise RuntimeError(
-        f"Could not generate a connected simple 3-regular graph on {N} "
-        f"vertices in {max_attempts} attempts."
-    )
-
-
 def is_connected(N: int, edges: np.ndarray) -> bool:
     nbrs: list[list[int]] = [[] for _ in range(N)]
     for a, b in edges:
@@ -528,6 +104,315 @@ def build_neighbors(N: int, edges: np.ndarray) -> np.ndarray:
     if not np.all(fill == 3):
         raise ValueError("Not all vertices have degree 3.")
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Crystalline Z=3 seed networks
+# --------------------------------------------------------------------------- #
+# A Z=3 crystalline seed gives a known-good starting graph for WWW annealing:
+# every initial bond has the same length, connectivity is by construction,
+# every vertex is exactly trivalent, and no long-distance chord stragglers
+# can drift vertices around during the initial L-BFGS. A subsequent high-T
+# WWW "burn-in" (see ``topology_burn_in``) destroys the crystalline memory;
+# with enough accepted moves the topology distribution is determined by the
+# Sellers energy, not by the seed. This is the Hemmann/Saba 2026 recipe;
+# combined with the burn-in it samples the same ensemble Sellers's refs
+# [27] (WWW 1985) and [28] (Mousseau-Barkema 2001) describe from a random
+# seed, but with markedly better-conditioned initial geometry.
+
+# Lattice entries each provide:
+#   sites_frac:       (n_sites, 3) fractional coords inside the unit cell
+#   bonds:            (n_bonds, 5) rows [vi, vj, dx, dy, dz] — bond connects
+#                     site vi in cell (i,j,k) to site vj in cell
+#                     (i+dx, j+dy, k+dz), PBC-wrapped
+#   cell_aspect:      (cx, cy, cz) ratios of unit-cell edges
+#   target_bond_frac: bond length in units of `ax` (the Cartesian x-edge
+#                     of the tile; valid for orthorhombic lattices with
+#                     symmetric aspect)
+#   vertices_per_cell
+
+_LATTICE_LIBRARY: Dict[str, Dict] = {
+    "diamond3": {
+        # 8 atoms per cubic unit cell. The diamond (Z=4) lattice with a
+        # perfect matching of 4 bonds removed -> Z=3 everywhere.
+        # Sublattice A = sites 0..3, B = sites 4..7 (offset by 1/4 along
+        # the cubic diagonal). The matching pairs each A_i with a unique
+        # B_j AND uses each of the 4 tetrahedral directions
+        # {d1=(1,1,1)/4, d2=(1,-1,-1)/4, d3=(-1,1,-1)/4, d4=(-1,-1,1)/4}
+        # exactly once: {A0-B0 (d1), A1-B3 (d3), A2-B1 (d4), A3-B2 (d2)}.
+        # This direction-balanced removal keeps the remaining 12 bonds
+        # 3D-connected across cells (verified at runtime by ``is_connected``).
+        # Using fewer than 4 directions leaves slab-like disconnected
+        # components (e.g. {A0-B0, A1-B2, A2-B1, A3-B3} splits the
+        # (5,5,5) tile into 5 disconnected 200-vertex slabs).
+        # All remaining bonds have Cartesian length a*sqrt(3)/4.
+        "sites_frac": np.array([
+            [0.00, 0.00, 0.00],   # A0
+            [0.00, 0.50, 0.50],   # A1
+            [0.50, 0.00, 0.50],   # A2
+            [0.50, 0.50, 0.00],   # A3
+            [0.25, 0.25, 0.25],   # B0
+            [0.25, 0.75, 0.75],   # B1
+            [0.75, 0.25, 0.75],   # B2
+            [0.75, 0.75, 0.25],   # B3
+        ], dtype=np.float64),
+        "bonds": np.array([
+            # 12 bonds = (16 diamond bonds) - (4 removed). Format:
+            # [vi, vj, dx, dy, dz]. Removed bonds (commented out below
+            # the table) are A0-B0(0,0,0), A1-B3(-1,0,0), A2-B1(0,-1,0),
+            # A3-B2(0,0,-1) -- each in a unique tetrahedral direction.
+            [0, 5,  0, -1, -1],  # A0-B1 (d2)
+            [0, 6, -1,  0, -1],  # A0-B2 (d3)
+            [0, 7, -1, -1,  0],  # A0-B3 (d4)
+            [1, 4,  0,  0,  0],  # A1-B0 (d2)
+            [1, 5,  0,  0,  0],  # A1-B1 (d1)
+            [1, 6, -1,  0,  0],  # A1-B2 (d4)
+            [2, 4,  0,  0,  0],  # A2-B0 (d3)
+            [2, 6,  0,  0,  0],  # A2-B2 (d1)
+            [2, 7,  0, -1,  0],  # A2-B3 (d2)
+            [3, 4,  0,  0,  0],  # A3-B0 (d4)
+            [3, 5,  0,  0, -1],  # A3-B1 (d3)
+            [3, 7,  0,  0,  0],  # A3-B3 (d1)
+        ], dtype=np.int64),
+        "cell_aspect": (1.0, 1.0, 1.0),
+        "target_bond_frac": math.sqrt(3.0) / 4.0,
+        "vertices_per_cell": 8,
+    },
+}
+
+
+def _pick_tile_dims(N: int, box: np.ndarray, lattice_key: str,
+                    strict: bool = False) -> Tuple[int, int, int, int]:
+    """Pick (nx, ny, nz) tiling factors so that vertices_per_cell * nx*ny*nz
+    is as close to ``N`` as possible while keeping per-axis cell size
+    roughly equal (matching the box aspect).
+
+    Returns (nx, ny, nz, N_actual). Warns if N_actual != N; raises if
+    ``strict``.
+    """
+    lat = _LATTICE_LIBRARY[lattice_key]
+    n_per_cell = lat["vertices_per_cell"]
+    cax, cay, caz = lat["cell_aspect"]
+
+    target_cells = max(1, int(round(N / n_per_cell)))
+
+    V_unit = cax * cay * caz
+    V_box = float(box[0] * box[1] * box[2])
+    a = (V_box / (target_cells * V_unit)) ** (1.0 / 3.0)
+    nx = max(1, int(round(box[0] / (a * cax))))
+    ny = max(1, int(round(box[1] / (a * cay))))
+    nz = max(1, int(round(box[2] / (a * caz))))
+
+    # Adjust to hit target_cells exactly.
+    safety = 0
+    while nx * ny * nz != target_cells and safety < 100:
+        ratios = (nx * cax / box[0], ny * cay / box[1], nz * caz / box[2])
+        if nx * ny * nz < target_cells:
+            idx = int(np.argmin(ratios))
+            if idx == 0:
+                nx += 1
+            elif idx == 1:
+                ny += 1
+            else:
+                nz += 1
+        else:
+            idx = int(np.argmax(ratios))
+            if idx == 0 and nx > 1:
+                nx -= 1
+            elif idx == 1 and ny > 1:
+                ny -= 1
+            elif idx == 2 and nz > 1:
+                nz -= 1
+            else:
+                break
+        safety += 1
+
+    N_actual = nx * ny * nz * n_per_cell
+    if N_actual != N:
+        msg = (
+            f"crystal_seed_network: requested N={N} not exactly tilable "
+            f"with lattice '{lattice_key}' (vertices_per_cell={n_per_cell}); "
+            f"using N={N_actual} via tiling ({nx},{ny},{nz})."
+        )
+        if strict:
+            raise ValueError(msg)
+        warnings.warn(msg, stacklevel=3)
+    return nx, ny, nz, N_actual
+
+
+def crystal_seed_network(
+    N: int,
+    box: Union[float, Tuple[float, float, float], np.ndarray],
+    d0: float,
+    rng: np.random.Generator,
+    lattice: str = "diamond3",
+    jitter_sigma: float = 0.10,
+    strict_tiling: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, Dict]:
+    """Build a periodic Z=3 crystalline seed network.
+
+    Returns
+    -------
+    positions : (N_actual, 3) float64
+        Vertex positions wrapped into [-L/2, L/2]^3, plus optional
+        Gaussian jitter of std ``jitter_sigma * d0`` per Cartesian
+        component (added after the Z=3 / connectivity invariants are
+        checked).
+    edges : (E, 2) int64
+        E = 3 * N_actual / 2 unique edges, lexicographically sorted.
+    meta : dict
+        Keys: ``tile``, ``lattice_constant``, ``seed_bond_length``,
+        ``lattice``, ``N_actual``.
+
+    Notes
+    -----
+    Seed bond length is set by tiling geometry, not by ``d0``: after
+    tiling, the mean bond length is ``a * target_bond_frac`` where
+    ``a = box[0] / nx`` (e.g. ``a * sqrt(3)/4`` for ``diamond3``).
+    The caller's initial L-BFGS pulls bonds toward ``d0`` via the
+    Keating ``f1`` term; if ``seed_bond_length / d0`` is far from 1
+    the relax may distort the lattice substantially, so this routine
+    warns when ``|ratio - 1| > 0.2``.
+
+    The diamond3 lattice is the cubic diamond (Z=4) topology with a
+    perfect matching of 4 bonds removed per cubic cell to drop to Z=3.
+    Bond angles are tetrahedral (109.47 deg), not at Sellers's 120 deg
+    f2 target — so SW moves from the seed are downhill in energy
+    overall and the high-T burn-in disorders the topology quickly.
+    """
+    if lattice not in _LATTICE_LIBRARY:
+        raise ValueError(
+            f"Unknown lattice '{lattice}'. Available: "
+            f"{list(_LATTICE_LIBRARY.keys())}"
+        )
+    lat = _LATTICE_LIBRARY[lattice]
+    box_arr = coerce_box(box)
+    nx, ny, nz, N_actual = _pick_tile_dims(N, box_arr, lattice, strict_tiling)
+    sites_frac = lat["sites_frac"]
+    bonds_template = lat["bonds"]
+    n_per_cell = sites_frac.shape[0]
+
+    ax = box_arr[0] / nx
+    ay = box_arr[1] / ny
+    az = box_arr[2] / nz
+    seed_bond_length = ax * lat["target_bond_frac"]
+    if abs(seed_bond_length / d0 - 1.0) > 0.2:
+        warnings.warn(
+            f"crystal_seed_network: seed bond length "
+            f"{seed_bond_length:.3g} differs from d0={d0:.3g} by more "
+            f"than 20%. Initial relax will distort the lattice; consider "
+            f"adjusting (num_vertices, bounds_microns, edge_length) so "
+            f"the seed bond length matches d0 within ~20%.",
+            stacklevel=2,
+        )
+
+    # Tile positions.
+    positions = np.empty((N_actual, 3), dtype=np.float64)
+    flat_idx = 0
+    for ix in range(nx):
+        for iy in range(ny):
+            for iz in range(nz):
+                base = np.array([ix * ax, iy * ay, iz * az])
+                for s in range(n_per_cell):
+                    positions[flat_idx, 0] = base[0] + sites_frac[s, 0] * ax
+                    positions[flat_idx, 1] = base[1] + sites_frac[s, 1] * ay
+                    positions[flat_idx, 2] = base[2] + sites_frac[s, 2] * az
+                    flat_idx += 1
+    # Centre and wrap into canonical box.
+    positions -= box_arr / 2.0
+    positions -= box_arr * np.round(positions / box_arr)
+
+    # Build edges.
+    n_bonds_template = bonds_template.shape[0]
+    edges_buf = np.empty((nx * ny * nz * n_bonds_template, 2), dtype=np.int64)
+    edge_count = 0
+    for ix in range(nx):
+        for iy in range(ny):
+            for iz in range(nz):
+                src_cell_base = ((ix * ny + iy) * nz + iz) * n_per_cell
+                for b in range(n_bonds_template):
+                    vi = int(bonds_template[b, 0])
+                    vj = int(bonds_template[b, 1])
+                    dx = int(bonds_template[b, 2])
+                    dy = int(bonds_template[b, 3])
+                    dz = int(bonds_template[b, 4])
+                    dst_ix = (ix + dx) % nx
+                    dst_iy = (iy + dy) % ny
+                    dst_iz = (iz + dz) % nz
+                    src_atom = src_cell_base + vi
+                    dst_atom = ((dst_ix * ny + dst_iy) * nz + dst_iz) * n_per_cell + vj
+                    if src_atom == dst_atom:
+                        raise RuntimeError(
+                            f"crystal_seed_network: bond template "
+                            f"(vi={vi}, vj={vj}, ofs=({dx},{dy},{dz})) "
+                            f"is a self-loop at cell ({ix},{iy},{iz}); "
+                            f"lattice '{lattice}' is invalid (too small "
+                            f"a tiling for the given offset?)."
+                        )
+                    if src_atom < dst_atom:
+                        edges_buf[edge_count, 0] = src_atom
+                        edges_buf[edge_count, 1] = dst_atom
+                    else:
+                        edges_buf[edge_count, 0] = dst_atom
+                        edges_buf[edge_count, 1] = src_atom
+                    edge_count += 1
+    edges = np.unique(edges_buf[:edge_count], axis=0)
+
+    # Invariants.
+    expected_E = (3 * N_actual) // 2
+    if edges.shape[0] != expected_E:
+        raise RuntimeError(
+            f"crystal_seed_network: built {edges.shape[0]} edges "
+            f"(expected {expected_E} = 3N/2). Lattice '{lattice}' "
+            f"bonds list has duplicates or missing entries."
+        )
+    deg = np.zeros(N_actual, dtype=np.int64)
+    np.add.at(deg, edges[:, 0], 1)
+    np.add.at(deg, edges[:, 1], 1)
+    if not np.all(deg == 3):
+        bad = int(np.flatnonzero(deg != 3)[0])
+        raise RuntimeError(
+            f"crystal_seed_network: vertex {bad} has degree {deg[bad]} "
+            f"(expected 3). Lattice '{lattice}' is not Z=3."
+        )
+    if not is_connected(N_actual, edges):
+        raise RuntimeError(
+            f"crystal_seed_network: lattice '{lattice}' is not "
+            f"3D-connected at tiling ({nx},{ny},{nz})."
+        )
+
+    # Position jitter (after invariant checks).
+    if jitter_sigma > 0:
+        sigma = jitter_sigma * d0
+        positions = positions + rng.normal(0.0, sigma, size=positions.shape)
+        positions -= box_arr * np.round(positions / box_arr)
+
+    meta = {
+        "tile": (nx, ny, nz),
+        "lattice_constant": (ax, ay, az),
+        "seed_bond_length": seed_bond_length,
+        "lattice": lattice,
+        "N_actual": N_actual,
+    }
+    return positions, edges, meta
+
+
+def _voxel_density_std(positions: np.ndarray, box: np.ndarray,
+                       ngrid: int = 4) -> float:
+    """Std of vertex count in an ngrid^3 voxel grid over the box.
+
+    Cheap surrogate for vertex-uniformity / void-clustering. Lower is
+    more uniform; for the Sellers reference network ngrid=4 gives
+    ~2.79. Used by ``topology_burn_in`` as a plateau-detector signal.
+    """
+    pos = positions - box * np.round(positions / box)
+    fracs = (pos + box / 2.0) / box  # in [0, 1)
+    cells = np.floor(fracs * ngrid).astype(np.int64) % ngrid
+    counts = np.zeros((ngrid, ngrid, ngrid), dtype=np.int64)
+    np.add.at(counts, (cells[:, 0], cells[:, 1], cells[:, 2]), 1)
+    return float(counts.std())
+
+
 
 
 def compute_local_shell_mask(
@@ -1215,6 +1100,154 @@ def www_anneal(
 
 
 # --------------------------------------------------------------------------- #
+# Topology burn-in (constant-T WWW phase to lose crystalline memory)
+# --------------------------------------------------------------------------- #
+def topology_burn_in(
+    positions: np.ndarray,
+    edges: np.ndarray,
+    neighbors: np.ndarray,
+    box: np.ndarray,
+    d0: float,
+    weights: Tuple[float, float, float, float],
+    n_moves: int,
+    T: Optional[float],
+    rng: np.random.Generator,
+    relax_local_iters: int = 100,
+    relax_global_iters: int = 500,
+    local_shell_depth: Optional[int] = 4,
+    global_fallback_threshold: float = float("inf"),
+    use_jax: bool = False,
+    use_jaxopt: bool = False,
+    calib_moves: int = 200,
+    calib_target_acceptance: float = 0.70,
+    calib_T_candidates: Optional[Tuple[float, ...]] = None,
+    plateau_window: int = 2000,
+    plateau_tol: float = 0.05,
+    verbose: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
+    """Constant-temperature WWW Stone-Wales phase to lose crystalline memory.
+
+    Runs the existing ``www_anneal`` with no LSU target and a flat
+    temperature schedule (T0 = T_final = T). Every move is judged
+    purely by ΔE + Metropolis, so the topology distribution after
+    enough accepted moves is determined by the Sellers energy, not by
+    the seed (Hemmann/Saba 2026 recipe).
+
+    Temperature is either user-supplied or auto-calibrated via a short
+    probe sweep that picks the smallest T from ``calib_T_candidates``
+    yielding probe acceptance ≥ ``calib_target_acceptance``. The
+    burn-in then runs in chunks of ``plateau_window`` moves, and stops
+    early when the 4^3-voxel-density std plateaus (relative std of the
+    last three chunk metrics below ``plateau_tol``) — a guard against
+    overrunning when the topology has already randomized.
+
+    Returns
+    -------
+    positions, edges, neighbors, info
+        ``info`` has keys ``T_used``, ``moves``, ``metric_history``,
+        ``calibration`` (list of (T, acceptance) probe pairs, empty if
+        T was user-supplied).
+    """
+    if n_moves <= 0:
+        return positions, edges, neighbors, {"T_used": None, "moves": 0,
+                                             "metric_history": [],
+                                             "calibration": []}
+
+    calibration: list = []
+    if T is None:
+        if calib_T_candidates is None:
+            calib_T_candidates = (0.01, 0.05, 0.2, 0.5, 1.0, 2.0, 5.0)
+        T_used = float(calib_T_candidates[-1])
+        for T_try in calib_T_candidates:
+            probe_seed = int(rng.integers(0, 2**31 - 1))
+            _, _, _, hist = www_anneal(
+                positions.copy(), edges.copy(), neighbors.copy(), box,
+                d0, weights,
+                n_iterations=calib_moves,
+                T0=float(T_try), T_final=float(T_try),
+                rng=np.random.default_rng(probe_seed),
+                target_lsu=None,
+                relax_local_iters=relax_local_iters,
+                relax_global_iters=relax_global_iters,
+                relax_global_every=0,
+                global_fallback_threshold=global_fallback_threshold,
+                local_shell_depth=local_shell_depth,
+                check_lsu_every=0,
+                use_jax=use_jax, use_jaxopt=use_jaxopt,
+                verbose=False,
+            )
+            acc = hist["accepted"] / max(1, hist["proposed"])
+            calibration.append((float(T_try), float(acc)))
+            if verbose:
+                print(f"[burn-in calibration] T={T_try:.3g} "
+                      f"acc={acc:.2%} (probe {calib_moves} moves)")
+            if acc >= calib_target_acceptance:
+                T_used = float(T_try)
+                break
+        if verbose:
+            print(f"[burn-in] selected T={T_used:.3g}")
+    else:
+        T_used = float(T)
+        if verbose:
+            print(f"[burn-in] T={T_used:.3g} (user-supplied)")
+
+    metric_history = []
+    moves_done = 0
+    accepted_total = 0
+    proposed_total = 0
+    t_start = time.time()
+    while moves_done < n_moves:
+        chunk = min(plateau_window, n_moves - moves_done)
+        positions, edges, neighbors, hist_chunk = www_anneal(
+            positions, edges, neighbors, box, d0, weights,
+            n_iterations=chunk,
+            T0=T_used, T_final=T_used, rng=rng,
+            target_lsu=None,
+            relax_local_iters=relax_local_iters,
+            relax_global_iters=relax_global_iters,
+            relax_global_every=0,
+            global_fallback_threshold=global_fallback_threshold,
+            local_shell_depth=local_shell_depth,
+            check_lsu_every=0,
+            use_jax=use_jax, use_jaxopt=use_jaxopt,
+            verbose=False,
+        )
+        moves_done += chunk
+        accepted_total += hist_chunk["accepted"]
+        proposed_total += hist_chunk["proposed"]
+
+        std_metric = _voxel_density_std(positions, box, ngrid=4)
+        metric_history.append(std_metric)
+        if verbose:
+            acc_chunk = hist_chunk["accepted"] / max(1, hist_chunk["proposed"])
+            print(f"[burn-in] moves={moves_done}/{n_moves}  "
+                  f"voxel_std(4^3)={std_metric:.3f}  "
+                  f"acc_chunk={acc_chunk:.2%}  "
+                  f"elapsed={time.time()-t_start:.1f}s")
+
+        if len(metric_history) >= 3:
+            recent = np.array(metric_history[-3:])
+            denom = max(float(recent.mean()), 1e-12)
+            if float(recent.std()) / denom < plateau_tol:
+                if verbose:
+                    print(f"[burn-in] plateau at moves={moves_done}: "
+                          f"voxel_std stable at {recent.mean():.3f} "
+                          f"(rel std {recent.std()/denom:.3%} < "
+                          f"{plateau_tol:.0%})")
+                break
+
+    info = {
+        "T_used": T_used,
+        "moves": moves_done,
+        "accepted": accepted_total,
+        "proposed": proposed_total,
+        "metric_history": metric_history,
+        "calibration": calibration,
+    }
+    return positions, edges, neighbors, info
+
+
+# --------------------------------------------------------------------------- #
 # LSU statistic
 # --------------------------------------------------------------------------- #
 def _build_tree(
@@ -1616,6 +1649,11 @@ def generate_lsu_network(
     relax_global_iters: int = 500,
     global_fallback_threshold: float = float("inf"),
     local_shell_depth: Optional[int] = 4,
+    seed_lattice: str = "diamond3",
+    seed_jitter_sigma: float = 0.10,
+    strict_tiling: bool = False,
+    topology_burn_in_moves: int = 20_000,
+    topology_burn_in_T: Optional[float] = None,
     seed: int = 42,
     use_jax: Optional[bool] = None,
     use_jaxopt: bool = False,
@@ -1701,6 +1739,35 @@ def generate_lsu_network(
         (the previous behaviour; produces corner/edge void clustering at high
         iteration counts because vertices anywhere in the cell can drift
         toward each other under the bonded-only Sellers energy).
+    seed_lattice : str
+        Crystalline Z=3 lattice used as the WWW seed. Currently supports
+        ``'diamond3'`` (default): cubic diamond topology with a perfect
+        matching of 4 bonds removed per cubic cell to drop from Z=4 to
+        Z=3; 8 vertices per cubic cell, all bond lengths equal. Replaces
+        the legacy Barkema-Mousseau random seeder which produced long
+        chord stragglers (3–5·d0) and seeded void clustering. See
+        ``crystal_seed_network`` for details.
+    seed_jitter_sigma : float
+        Std-dev of Gaussian position jitter added to the crystalline
+        seed, in units of ``edge_length``. Default 0.10. Breaks exact
+        lattice symmetry so the first SW moves see a non-degenerate
+        Hessian.
+    strict_tiling : bool
+        If True, raise ValueError when the requested ``num_vertices``
+        cannot be exactly tiled by ``seed_lattice``'s unit cell.
+        Default False: emit a warning and use the nearest valid N.
+    topology_burn_in_moves : int
+        Number of constant-temperature WWW Stone-Wales moves run before
+        the production annealing to destroy crystalline memory of the
+        seed. Default 20_000. Set to 0 to skip burn-in (only useful for
+        diagnostic runs where you want to inspect the bare crystalline
+        seed). The burn-in uses ``www_anneal`` with no LSU target and
+        T0 = T_final = ``topology_burn_in_T``; it stops early when the
+        4^3-voxel-density std plateaus. See ``topology_burn_in``.
+    topology_burn_in_T : float or None
+        Temperature for the burn-in. None (default) auto-calibrates via
+        a short probe sweep to ~70% acceptance. A user-supplied value
+        skips calibration; pick large enough to keep acceptance > 50%.
     seed : int
         Random seed for reproducibility.
     use_jax : bool, optional
@@ -1797,30 +1864,70 @@ def generate_lsu_network(
               f"jaxopt={'on' if use_jaxopt_eff else 'off'}")
 
     # Seed network -----------------------------------------------------------
-    # Barkema-Mousseau (PRB 62, 4985, 2000) §II.A: hard-core uniform vertex
-    # placement in the periodic box, then bonds grown along proximity. This
-    # gives short, near-d0 seed bonds and avoids the empty-region artifact
-    # of the configuration-model seed (random_3regular_graph).
-    positions, edges = bm_initial_network(N, box, edge_length, rng)
-    edges = edges.copy()
+    # Crystalline Z=3 seed (default: diamond-minus-matching, 'diamond3').
+    # Replaces the legacy Barkema-Mousseau random seeder which produced
+    # long chord stragglers (3–5*d0) for the few isolated degree-2
+    # vertices, then dragged vertices across the cell during the initial
+    # L-BFGS and seeded the void-clustering drift WWW inherits.
+    # See ``crystal_seed_network`` and the Hemmann/Saba 2026 precedent.
+    positions, edges, seed_meta = crystal_seed_network(
+        N, box, edge_length, rng,
+        lattice=seed_lattice,
+        jitter_sigma=seed_jitter_sigma,
+        strict_tiling=strict_tiling,
+    )
+    if seed_meta["N_actual"] != N:
+        # Tiling rounded N. Re-derive num_rods to stay consistent.
+        N = seed_meta["N_actual"]
+        num_rods = (3 * N) // 2
     neighbors = build_neighbors(N, edges)
     if verbose:
         seed_lengths = np.linalg.norm(
             pbc_displacement(positions[edges[:, 1]] - positions[edges[:, 0]], box),
             axis=1,
         )
-        print(f"[gen] BM seed: rod length mean={seed_lengths.mean():.3f}, "
+        print(f"[gen] crystal seed lattice='{seed_lattice}' "
+              f"tile={seed_meta['tile']} "
+              f"a={seed_meta['lattice_constant'][0]:.3f}: "
+              f"bond length mean={seed_lengths.mean():.3f}, "
               f"std={seed_lengths.std():.3f}, "
               f"min={seed_lengths.min():.3f}, max={seed_lengths.max():.3f}")
 
-    # Initial global relaxation
+    # Initial global relaxation to settle the (lattice -> d0) bond-length
+    # rescale and any jitter.
     init_ctx = _RelaxContext(N, box, edge_length, weights,
                              use_jax=use_jax, use_jaxopt=use_jaxopt_eff)
     init_ctx.update_topology(edges, neighbors)
     positions, E0 = relax(positions, init_ctx, max_iter=relax_global_iters)
     positions = positions - box * np.round(positions / box)
     if verbose:
-        print(f"[gen] initial relax: E={E0:.4g}")
+        post_relax_lengths = np.linalg.norm(
+            pbc_displacement(positions[edges[:, 1]] - positions[edges[:, 0]], box),
+            axis=1,
+        )
+        print(f"[gen] initial relax: E={E0:.4g}, "
+              f"bond length mean={post_relax_lengths.mean():.3f} "
+              f"(target d0={edge_length})")
+
+    # Topology burn-in: constant-T WWW to lose crystalline memory ------------
+    if topology_burn_in_moves > 0:
+        positions, edges, neighbors, burn_info = topology_burn_in(
+            positions, edges, neighbors, box, edge_length, weights,
+            n_moves=topology_burn_in_moves,
+            T=topology_burn_in_T,
+            rng=rng,
+            relax_local_iters=relax_local_iters,
+            relax_global_iters=relax_global_iters,
+            local_shell_depth=local_shell_depth,
+            global_fallback_threshold=global_fallback_threshold,
+            use_jax=use_jax, use_jaxopt=use_jaxopt_eff,
+            verbose=verbose,
+        )
+        if verbose:
+            acc = burn_info["accepted"] / max(1, burn_info["proposed"])
+            print(f"[gen] burn-in done: T={burn_info['T_used']:.3g} "
+                  f"moves={burn_info['moves']} "
+                  f"accepted={burn_info['accepted']} ({acc:.1%})")
 
     # WWW annealing ----------------------------------------------------------
     positions, edges, neighbors, history = www_anneal(

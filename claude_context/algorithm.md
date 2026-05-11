@@ -8,39 +8,58 @@ Following Sellers et al., Nat. Commun. 8, 14439 (2017) and its supplement.
   (so N must be even, and num_rods must be a multiple of 3).
 - The cell is periodic; all vector quantities use minimum-image PBC.
 
-## 1.5. Seed network — Barkema-Mousseau (PRB 62, 4985, 2000) §II.A
-The Sellers supplement Methods cites Vink 2001 / Mousseau-Barkema 2001, both built
-on the Barkema-Mousseau 2000 procedure. The configuration model (random pairing of
-labelled stubs, then positions assigned uniformly afterwards) is what BM explicitly
-reject — it leaves long-range "memory-less" bonds that produce empty regions and a
-heavy-tailed bond-length distribution after relaxation.
+## 1.5. Seed network — crystalline Z=3 seed + WWW burn-in
+The pipeline now follows the Hemmann/Saba 2026 recipe (Adv. Funct. Mater.,
+PDF in `LSU Literature/`): start from a **periodic Z=3 crystalline net**
+and run a high-T constant-temperature **WWW Stone-Wales "burn-in"** to lose
+crystalline memory before the production LSU-targeted annealing begins.
+This matches the same ensemble Sellers's refs [27] (Wooten-Winer-Weaire
+1985) and [28] (Mousseau-Barkema 2001) describe — once burn-in is long
+enough, the topology distribution is determined by the Sellers energy,
+not the seed. The crystalline starting point gives a robust entry to
+that landscape: every initial bond is the same length, connectivity is
+by construction, every vertex is exactly trivalent, and no long-distance
+chord stragglers can drift vertices around during the initial L-BFGS.
 
-BM §II.A targets *tetravalent* (Si) networks via a single loop visiting each atom
-twice. For our trivalent case the loop visits each atom once and a chord matching
-lifts every vertex from degree 2 to degree 3.
+The legacy Barkema-Mousseau random seeder (`bm_initial_network`,
+`_build_trivalent_proximity_graph`, `poisson_disk_pbc`) was removed:
+it shortcut BM 2000's loop expansion with a Hamiltonian-cycle + greedy
+nearest-pair chord matching, which left 3–5·d0 stragglers for the few
+isolated degree-2 vertices and dragged vertices across the cell during
+relax — the void-clustering mechanism documented in
+`memory/project_known_issues.md`.
 
-Implemented in `bm_initial_network` / `_build_trivalent_proximity_graph`:
+### Implementation: `crystal_seed_network` + `topology_burn_in`
 
-1. **Hard-core placement** (`poisson_disk_pbc`, BM §II.A): N vertices placed
-   uniformly in [-L/2, L/2]^3 with PBC under a minimum-image separation
-   `r_min = 0.7·d0` (the Si analogue is 2.3 Å for d0 = 2.35 Å). The constraint
-   softens by 5% on excess rejection rate.
-2. **Stage A — Hamiltonian-like cycle via BM loop expansion**:
-   - Seed with a triangle of 3 mutually-close vertices.
-   - Iteratively insert each remaining vertex `A` into an existing edge
-     `(B, C)` when `dist(A, B), dist(A, C) ≤ r_cut = 1.7·d0`, replacing
-     `(B, C)` with `(A, B), (A, C)`. This is the BM elementary "+1 edge" move
-     (their Fig. 1) — A goes from degree 0 to 2; B, C stay at 2.
-   - Fallback: if no valid `(B, C)` exists for any remaining `A`, bond `A` to
-     its two nearest neighbours that still have degree < 3. May saturate
-     those neighbours to degree 3 a step early; Stage B then issues fewer
-     chords.
-3. **Stage B — Chord matching to degree 3**: repeatedly add the shortest
-   unbonded pair of degree-2 vertices. If the shortest valid pair lies
-   beyond `r_cut`, take it anyway — relaxation will pull it in.
-4. Outer loop in `bm_initial_network`: for each `r_cut` value try
-   `layouts_per_cutoff = 4` independent Poisson-disk layouts before
-   widening `r_cut` by 8%.
+1. **Build the crystalline lattice** (`crystal_seed_network`): pick the
+   tile (nx, ny, nz) so that `vertices_per_cell · nx·ny·nz ≈ N` (rounds
+   to nearest valid N; pass `strict_tiling=True` to raise instead).
+   Default lattice `diamond3`: the cubic diamond (Z=4) topology with a
+   perfect matching of 4 bonds removed per cubic cell to drop to Z=3.
+   8 atoms / cubic cell, all bond lengths a·sqrt(3)/4 where `a` is the
+   cubic-cell edge derived from the user's box. The matching uses each
+   of the 4 tetrahedral directions exactly once
+   ({A0-B0 d1, A1-B3 d3, A2-B1 d4, A3-B2 d2}) so the remaining graph
+   stays 3D-connected across cells. Using fewer directions splits the
+   lattice into disconnected slabs (verified by `is_connected` at the
+   end of seed construction). Bond angles are tetrahedral (109.47°),
+   not at Sellers's 120° f2 target — so SW moves are downhill on
+   average and burn-in disorders the topology quickly.
+2. **Position jitter**: Gaussian noise of std `jitter_sigma · d0`
+   (default 0.10) breaks exact symmetry so the first SW moves see a
+   non-degenerate Hessian.
+3. **Initial relax** (full-N L-BFGS, `relax_global_iters` iters): pulls
+   bonds from `a·sqrt(3)/4` to `d0` via the Keating f1 term and absorbs
+   the jitter. For N=1000 / box=11.44 / d0=0.8 this lands all bonds at
+   ~d0 with std 0.0 (perfect lattice), φ_22 = 1.0000.
+4. **Topology burn-in** (`topology_burn_in`): constant-T WWW with no
+   LSU target. T is auto-calibrated by a 200-move probe sweep to reach
+   ~70% acceptance (default), or user-supplied via `topology_burn_in_T`.
+   Runs in chunks of `plateau_window` moves; stops early when the
+   4^3-voxel-density std plateaus (relative std of last three chunk
+   metrics below 5%). Default `topology_burn_in_moves=20_000` (~28 min
+   on GPU at 84 ms/relax for N=1000). Uses the existing JAX-jitted
+   value_and_grad kernel — burn-in IS the GPU hot loop.
 
 ## 2. Energy (Supplement, Eq. 2)
     U = α f1({d}) + β f2({θ}) + γ f3({φ}) + δ f4({χ})

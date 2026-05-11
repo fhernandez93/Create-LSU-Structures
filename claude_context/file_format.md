@@ -27,6 +27,18 @@
 | `energy_weights`     | dict or None    | {'alpha':α, 'beta':β, 'gamma':γ, 'delta':δ}.           |
 | `target_tolerance`   | float           | Stop early if measured LSU is within this of target.   |
 | `check_lsu_every`    | int             | How often (in WWW iters) to measure LSU.               |
+| `seed_lattice`       | str             | Crystalline Z=3 seed: ``'diamond3'`` (default).        |
+|                      |                 | Cubic diamond minus a 4-bond matching, 8 vertices/cubic|
+|                      |                 | cell. Replaces the legacy BM random seeder.            |
+| `seed_jitter_sigma`  | float           | Gaussian jitter on seed positions, in units of d0.     |
+|                      |                 | Default 0.10. Breaks exact lattice symmetry.           |
+| `strict_tiling`      | bool            | If True, raise when N is not exactly tilable by the    |
+|                      |                 | seed lattice. Default False (warn and round).          |
+| `topology_burn_in_moves` | int         | Constant-T WWW Stone-Wales moves run before the        |
+|                      |                 | production annealing to lose crystalline memory.       |
+|                      |                 | Default 20_000. Set 0 to skip.                         |
+| `topology_burn_in_T` | float or None   | Temperature for the burn-in. None (default) auto-      |
+|                      |                 | calibrates via a probe sweep to ~70% acceptance.       |
 
 ## Output
 

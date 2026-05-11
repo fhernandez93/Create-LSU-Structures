@@ -132,6 +132,44 @@ def build_neighbors(N: int, edges: np.ndarray) -> np.ndarray:
 #   vertices_per_cell
 
 _LATTICE_LIBRARY: Dict[str, Dict] = {
+    "srs": {
+        # The single-network gyroid / srs net (I4_132, Wyckoff 8a with
+        # x=1/8), used by Hemmann/Saba for the Z=3 gyroid case and by
+        # Sellers as the ordered parent of amorphous gyroids. It is the
+        # natural crystalline seed here: 8 vertices per cubic cell, all
+        # bonds have length a*sqrt(2)/4, and every vertex has three
+        # coplanar bonds at 120 degrees (cos theta = -1/2), exactly matching
+        # the Sellers f2 target before disorder is introduced.
+        "sites_frac": np.array([
+            [1, 1, 1],
+            [3, 7, 5],
+            [7, 5, 3],
+            [5, 3, 7],
+            [5, 5, 5],
+            [7, 3, 1],
+            [3, 1, 7],
+            [1, 7, 3],
+        ], dtype=np.float64) / 8.0,
+        "bonds": np.array([
+            # Nearest-neighbour srs bonds. Format [vi, vj, dx, dy, dz],
+            # connecting vi in the current cell to vj in the offset cell.
+            [0, 5, -1,  0,  0],
+            [0, 6,  0,  0, -1],
+            [0, 7,  0, -1,  0],
+            [1, 4,  0,  0,  0],
+            [1, 6,  0,  1,  0],
+            [1, 7,  0,  0,  0],
+            [2, 4,  0,  0,  0],
+            [2, 5,  0,  0,  0],
+            [2, 7,  1,  0,  0],
+            [3, 4,  0,  0,  0],
+            [3, 5,  0,  0,  1],
+            [3, 6,  0,  0,  0],
+        ], dtype=np.int64),
+        "cell_aspect": (1.0, 1.0, 1.0),
+        "target_bond_frac": math.sqrt(2.0) / 4.0,
+        "vertices_per_cell": 8,
+    },
     "diamond3": {
         # 8 atoms per cubic unit cell. The diamond (Z=4) lattice with a
         # perfect matching of 4 bonds removed -> Z=3 everywhere.
@@ -245,7 +283,7 @@ def crystal_seed_network(
     box: Union[float, Tuple[float, float, float], np.ndarray],
     d0: float,
     rng: np.random.Generator,
-    lattice: str = "diamond3",
+    lattice: str = "srs",
     jitter_sigma: float = 0.10,
     strict_tiling: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, Dict]:
@@ -268,17 +306,20 @@ def crystal_seed_network(
     -----
     Seed bond length is set by tiling geometry, not by ``d0``: after
     tiling, the mean bond length is ``a * target_bond_frac`` where
-    ``a = box[0] / nx`` (e.g. ``a * sqrt(3)/4`` for ``diamond3``).
+    ``a = box[0] / nx`` (e.g. ``a * sqrt(2)/4`` for the default
+    ``srs`` gyroid net).
     The caller's initial L-BFGS pulls bonds toward ``d0`` via the
     Keating ``f1`` term; if ``seed_bond_length / d0`` is far from 1
     the relax may distort the lattice substantially, so this routine
     warns when ``|ratio - 1| > 0.2``.
 
-    The diamond3 lattice is the cubic diamond (Z=4) topology with a
-    perfect matching of 4 bonds removed per cubic cell to drop to Z=3.
-    Bond angles are tetrahedral (109.47 deg), not at Sellers's 120 deg
-    f2 target — so SW moves from the seed are downhill in energy
-    overall and the high-T burn-in disorders the topology quickly.
+    The default ``srs`` lattice is the single-network gyroid parent used
+    for Z=3 gyroid WWW evolution: 8 vertices per cubic cell, equal bond
+    lengths, and 120-degree bond angles. ``diamond3`` remains available
+    for diagnostics; it is cubic diamond (Z=4) with a perfect matching
+    of 4 bonds removed per cubic cell to drop to Z=3, so its bond angles
+    are tetrahedral (109.47 degrees) rather than Sellers's 120-degree
+    f2 target.
     """
     if lattice not in _LATTICE_LIBRARY:
         raise ValueError(
@@ -411,6 +452,72 @@ def _voxel_density_std(positions: np.ndarray, box: np.ndarray,
     counts = np.zeros((ngrid, ngrid, ngrid), dtype=np.int64)
     np.add.at(counts, (cells[:, 0], cells[:, 1], cells[:, 2]), 1)
     return float(counts.std())
+
+
+_LOW_K_CACHE: Dict[int, np.ndarray] = {}
+
+
+def _low_k_hkl(kmax: int) -> np.ndarray:
+    """Integer reciprocal vectors with |hkl| <= kmax, excluding zero."""
+    kmax = int(kmax)
+    if kmax <= 0:
+        return np.empty((0, 3), dtype=np.float64)
+    cached = _LOW_K_CACHE.get(kmax)
+    if cached is not None:
+        return cached
+    hkl = []
+    k2_max = kmax * kmax
+    for h in range(-kmax, kmax + 1):
+        for k in range(-kmax, kmax + 1):
+            for l in range(-kmax, kmax + 1):
+                if h == 0 and k == 0 and l == 0:
+                    continue
+                if h * h + k * k + l * l <= k2_max:
+                    hkl.append((h, k, l))
+    out = np.asarray(hkl, dtype=np.float64)
+    _LOW_K_CACHE[kmax] = out
+    return out
+
+
+def low_k_structure_factor(
+    positions: np.ndarray,
+    box: np.ndarray,
+    kmax: int = 2,
+) -> float:
+    """Mean low-k vertex structure factor S(k) over integer shells.
+
+    This is a cheap PBC-aware large-scale homogeneity metric. The bonded
+    Sellers / Keating-like energy controls local bond geometry but has no
+    term suppressing long-wavelength density fluctuations; Hemmann/Saba
+    likewise note that pore size and hyperuniformity are not directly
+    controlled by the local strain energy. Penalising the lowest reciprocal
+    modes during Metropolis acceptance discourages the corner/face voids seen
+    in long WWW runs without changing the local L-BFGS geometry relax.
+    """
+    hkl = _low_k_hkl(kmax)
+    if hkl.size == 0:
+        return 0.0
+    box = np.asarray(box, dtype=np.float64)
+    pos = np.asarray(positions, dtype=np.float64)
+    pos = pos - box * np.round(pos / box)
+    phases = 2.0 * math.pi * (pos / box) @ hkl.T
+    amp = np.exp(1j * phases).sum(axis=0)
+    S = (np.abs(amp) ** 2) / max(1, pos.shape[0])
+    return float(S.mean())
+
+
+def _acceptance_objective(
+    strain_energy: float,
+    positions: np.ndarray,
+    box: np.ndarray,
+    uniformity_weight: float,
+    uniformity_kmax: int,
+) -> Tuple[float, float]:
+    """Return (Metropolis objective, low-k S metric)."""
+    if uniformity_weight <= 0.0:
+        return float(strain_energy), 0.0
+    s_low = low_k_structure_factor(positions, box, kmax=uniformity_kmax)
+    return float(strain_energy) + float(uniformity_weight) * s_low, s_low
 
 
 
@@ -640,13 +747,14 @@ if HAS_JAX:
         return float(e), g_arr
 
     def _jaxopt_value_and_grad(x_flat, edges_j, triples_j, quads_j,
-                               box_j, d0_j, w_j):
+                               box_j, d0_j, w_j, mask_flat_j):
         # Module-level wrapper kept identity-stable so that jaxopt's internal
         # JIT cache stays warm across Stone-Wales updates. Topology arrays
         # are passed as run-time arguments (not closure captures) to avoid
         # retracing when their *values* change.
-        return _value_and_grad_jit(x_flat, edges_j, triples_j, quads_j,
+        e, g = _value_and_grad_jit(x_flat, edges_j, triples_j, quads_j,
                                    box_j, d0_j, w_j)
+        return e, g * mask_flat_j
 
 
 # --------------------------------------------------------------------------- #
@@ -679,7 +787,7 @@ class _RelaxContext:
             self._box_j = jnp.asarray(self.box)
             self._w_j = jnp.asarray(self.weights)
             self._d0_j = jnp.float64(self.d0)
-            self._mask_flat_j = None
+            self._mask_flat_j = jnp.ones((3 * self.N,), dtype=jnp.float64)
             # Cache jaxopt LBFGS instances keyed by (maxiter, tol). Each
             # instance lazily JIT-compiles its inner while-loop on first
             # call; reusing the same instance across WWW iterations keeps
@@ -700,7 +808,7 @@ class _RelaxContext:
             self._mask_flat = None
             self._moving_idx = None
             if self.use_jax:
-                self._mask_flat_j = None
+                self._mask_flat_j = jnp.ones((3 * self.N,), dtype=jnp.float64)
             return
         mask = np.asarray(mask, dtype=bool)
         if mask.shape != (self.N,):
@@ -781,10 +889,9 @@ def relax(
     the JIT-compiled ``value_and_grad`` (single host→device call per
     gradient eval, ~26 µs on CPU). Optional ``ctx.use_jaxopt=True`` swaps
     in ``jaxopt.LBFGS`` which keeps the L-BFGS loop on-device — only worth
-    it on a GPU; on CPU jaxopt's per-call dispatch overhead (~2 s) makes
-    it 50–150× slower than scipy+JIT regardless of problem size. The
-    jaxopt path does NOT honour the moving mask (cf. set_moving_mask) yet;
-    use the default scipy+JIT path for local-shell relaxation.
+    it on very large GPU runs; on this project scipy+JIT has benchmarked
+    faster at N≈1000. The jaxopt path receives the same gradient mask as
+    scipy+JIT, so local-shell relaxation semantics are identical.
     """
     if ctx.use_jaxopt:
         solver = ctx.get_jaxopt_solver(max_iter, tol)
@@ -792,7 +899,7 @@ def relax(
         res = solver.run(
             x0,
             ctx._edges_j, ctx._triples_j, ctx._quads_j,
-            ctx._box_j, ctx._d0_j, ctx._w_j,
+            ctx._box_j, ctx._d0_j, ctx._w_j, ctx._mask_flat_j,
         )
         new_pos = np.asarray(res.params, dtype=np.float64).reshape(ctx.N, 3)
         return new_pos, float(res.state.value)
@@ -949,6 +1056,8 @@ def www_anneal(
     global_fallback_threshold: float = float("inf"),
     local_shell_depth: Optional[int] = 4,
     check_lsu_every: int = 500,
+    uniformity_weight: float = 10.0,
+    uniformity_kmax: int = 2,
     use_jax: bool = False,
     use_jaxopt: bool = False,
     verbose: bool = True,
@@ -967,6 +1076,12 @@ def www_anneal(
     schedule polish ``relax_global_every`` is kept only for back-compat and
     is no-op when set to 0 (the new default); a non-zero value emits a
     deprecation warning.
+
+    ``uniformity_weight`` adds a low-k structure-factor penalty to the
+    Metropolis objective (not to the L-BFGS relax). This follows the
+    literature diagnosis that local bonded strain energies do not control
+    large pores / long-wavelength density fluctuations; set it to 0.0 for
+    strict Sellers Eq. 2 acceptance.
     """
     if relax_global_every:
         warnings.warn(
@@ -974,7 +1089,7 @@ def www_anneal(
             "re-introduces void clustering under the bonded-only Sellers "
             "energy. The Vink/Mousseau-Barkema scheme uses fallback-gated "
             "global relax instead — set `relax_global_every=0` and tune "
-            "`global_fallback_threshold` (default 0.0).",
+            "`global_fallback_threshold` (default inf/off).",
             DeprecationWarning, stacklevel=2,
         )
 
@@ -982,7 +1097,11 @@ def www_anneal(
     ctx = _RelaxContext(N, box, d0, weights, use_jax=use_jax, use_jaxopt=use_jaxopt)
     ctx.update_topology(edges, neighbors)
     E_curr = ctx.energy(positions.reshape(-1))
-    history = {"iter": [], "T": [], "E": [], "lsu": [], "accepted": 0,
+    objective_curr, S_low_curr = _acceptance_objective(
+        E_curr, positions, box, uniformity_weight, uniformity_kmax
+    )
+    history = {"iter": [], "T": [], "E": [], "objective": [],
+               "uniformity_S": [], "lsu": [], "accepted": 0,
                "proposed": 0, "global_fallbacks": 0}
 
     accepted = 0
@@ -1026,7 +1145,7 @@ def www_anneal(
             ctx.set_moving_mask(None)
 
         new_pos, E_new = relax(positions, ctx, max_iter=relax_local_iters)
-        dE = E_new - E_curr
+        strain_dE = E_new - E_curr
 
         # Vink/Mousseau-Barkema fallback gate: if the local-shell relax
         # failed to lower the energy by at least `global_fallback_threshold`,
@@ -1034,20 +1153,27 @@ def www_anneal(
         # accept. Replaces the previous fixed-schedule global polish, which
         # under the bonded-only Sellers energy let vertices drift toward
         # each other every K iterations and re-introduced void clustering.
-        if dE > global_fallback_threshold:
+        if strain_dE > global_fallback_threshold:
             ctx.set_moving_mask(None)
             new_pos, E_new = relax(new_pos, ctx, max_iter=relax_global_iters)
             # L-BFGS preserves energy under global PBC translation, so
             # positions can drift outside [-L/2, L/2]^3. Wrap back into the
             # canonical box (idempotent).
             new_pos = new_pos - box * np.round(new_pos / box)
-            dE = E_new - E_curr
+            strain_dE = E_new - E_curr
             fallback_count += 1
 
-        # Metropolis acceptance on the (possibly fallback-improved) ΔE.
+        objective_new, S_low_new = _acceptance_objective(
+            E_new, new_pos, box, uniformity_weight, uniformity_kmax
+        )
+        dE = objective_new - objective_curr
+
+        # Metropolis acceptance on the (possibly fallback-improved) objective.
         if dE <= 0 or rng.random() < math.exp(-dE / max(T, 1e-12)):
             positions = new_pos
             E_curr = E_new
+            objective_curr = objective_new
+            S_low_curr = S_low_new
             accepted += 1
         else:
             # Reject: revert topology and positions
@@ -1065,12 +1191,19 @@ def www_anneal(
             history["iter"].append(it + 1)
             history["T"].append(T)
             history["E"].append(E_curr)
+            history["objective"].append(objective_curr)
+            history["uniformity_S"].append(S_low_curr)
             history["lsu"].append(phi)
             if verbose:
                 acc_rate = accepted / max(1, proposed)
                 fb_rate = fallback_count / max(1, proposed)
+                uniformity_msg = (
+                    f"  S_low={S_low_curr:.4g}"
+                    if uniformity_weight > 0.0 else ""
+                )
                 print(
                     f"[WWW it={it+1:6d}] T={T:.4g}  E={E_curr:.4g}  "
+                    f"Obj={objective_curr:.4g}{uniformity_msg}  "
                     f"phi_{target_depth}{target_locality}={phi:.4f}  "
                     f"acc={acc_rate:.2%}  fb={fb_rate:.2%}  "
                     f"elapsed={time.time()-t_start:.1f}s"
@@ -1116,12 +1249,15 @@ def topology_burn_in(
     relax_global_iters: int = 500,
     local_shell_depth: Optional[int] = 4,
     global_fallback_threshold: float = float("inf"),
+    uniformity_weight: float = 10.0,
+    uniformity_kmax: int = 2,
+    target_accepts_per_vertex: Optional[float] = 4.0,
     use_jax: bool = False,
     use_jaxopt: bool = False,
     calib_moves: int = 200,
-    calib_target_acceptance: float = 0.70,
+    calib_target_acceptance: float = 0.20,
     calib_T_candidates: Optional[Tuple[float, ...]] = None,
-    plateau_window: int = 2000,
+    plateau_window: int = 500,
     plateau_tol: float = 0.05,
     verbose: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
@@ -1135,11 +1271,13 @@ def topology_burn_in(
 
     Temperature is either user-supplied or auto-calibrated via a short
     probe sweep that picks the smallest T from ``calib_T_candidates``
-    yielding probe acceptance ≥ ``calib_target_acceptance``. The
-    burn-in then runs in chunks of ``plateau_window`` moves, and stops
-    early when the 4^3-voxel-density std plateaus (relative std of the
-    last three chunk metrics below ``plateau_tol``) — a guard against
-    overrunning when the topology has already randomized.
+    yielding probe acceptance ≥ ``calib_target_acceptance``. The default
+    target is intentionally modest: Hemmann/Saba show that too many
+    accepted moves under a local bonded strain energy monotonically grows
+    pore-size metrics. The burn-in therefore also stops once the accepted
+    Stone-Wales involvement reaches ``target_accepts_per_vertex`` per
+    vertex, where each accepted move contributes four vertex involvements.
+    This is a maximum-randomization guard, not an LSU target.
 
     Returns
     -------
@@ -1150,13 +1288,17 @@ def topology_burn_in(
     """
     if n_moves <= 0:
         return positions, edges, neighbors, {"T_used": None, "moves": 0,
+                                             "accepted": 0, "proposed": 0,
+                                             "target_accepts_per_vertex":
+                                                 target_accepts_per_vertex,
                                              "metric_history": [],
                                              "calibration": []}
 
     calibration: list = []
     if T is None:
         if calib_T_candidates is None:
-            calib_T_candidates = (0.01, 0.05, 0.2, 0.5, 1.0, 2.0, 5.0)
+            calib_T_candidates = (0.005, 0.01, 0.02, 0.05, 0.1,
+                                  0.2, 0.5, 1.0, 2.0, 5.0)
         T_used = float(calib_T_candidates[-1])
         for T_try in calib_T_candidates:
             probe_seed = int(rng.integers(0, 2**31 - 1))
@@ -1172,6 +1314,8 @@ def topology_burn_in(
                 relax_global_every=0,
                 global_fallback_threshold=global_fallback_threshold,
                 local_shell_depth=local_shell_depth,
+                uniformity_weight=uniformity_weight,
+                uniformity_kmax=uniformity_kmax,
                 check_lsu_every=0,
                 use_jax=use_jax, use_jaxopt=use_jaxopt,
                 verbose=False,
@@ -1195,9 +1339,23 @@ def topology_burn_in(
     moves_done = 0
     accepted_total = 0
     proposed_total = 0
+    max_accepted = None
+    if target_accepts_per_vertex is not None and target_accepts_per_vertex > 0:
+        max_accepted = int(math.ceil(
+            float(target_accepts_per_vertex) * positions.shape[0] / 4.0
+        ))
     t_start = time.time()
     while moves_done < n_moves:
         chunk = min(plateau_window, n_moves - moves_done)
+        if max_accepted is not None and accepted_total >= max_accepted:
+            break
+        if max_accepted is not None and proposed_total > 0:
+            acc_rate = accepted_total / max(1, proposed_total)
+            if acc_rate > 0:
+                remaining_accepts = max(1, max_accepted - accepted_total)
+                chunk = min(chunk, max(25, int(math.ceil(
+                    1.25 * remaining_accepts / acc_rate
+                ))))
         positions, edges, neighbors, hist_chunk = www_anneal(
             positions, edges, neighbors, box, d0, weights,
             n_iterations=chunk,
@@ -1208,6 +1366,8 @@ def topology_burn_in(
             relax_global_every=0,
             global_fallback_threshold=global_fallback_threshold,
             local_shell_depth=local_shell_depth,
+            uniformity_weight=uniformity_weight,
+            uniformity_kmax=uniformity_kmax,
             check_lsu_every=0,
             use_jax=use_jax, use_jaxopt=use_jaxopt,
             verbose=False,
@@ -1220,10 +1380,27 @@ def topology_burn_in(
         metric_history.append(std_metric)
         if verbose:
             acc_chunk = hist_chunk["accepted"] / max(1, hist_chunk["proposed"])
+            accept_cap_msg = ""
+            if max_accepted is not None:
+                involvements = 4.0 * accepted_total / positions.shape[0]
+                accept_cap_msg = (
+                    f"  acc_per_vertex={involvements:.2f}/"
+                    f"{target_accepts_per_vertex:.2f}"
+                )
             print(f"[burn-in] moves={moves_done}/{n_moves}  "
                   f"voxel_std(4^3)={std_metric:.3f}  "
                   f"acc_chunk={acc_chunk:.2%}  "
+                  f"S_low={low_k_structure_factor(positions, box, uniformity_kmax):.4g}"
+                  f"{accept_cap_msg}  "
                   f"elapsed={time.time()-t_start:.1f}s")
+
+        if max_accepted is not None and accepted_total >= max_accepted:
+            if verbose:
+                involvements = 4.0 * accepted_total / positions.shape[0]
+                print(f"[burn-in] accepted-move cap reached: "
+                      f"{accepted_total} accepted moves "
+                      f"({involvements:.2f} vertex involvements per vertex)")
+            break
 
         if len(metric_history) >= 3:
             recent = np.array(metric_history[-3:])
@@ -1241,6 +1418,7 @@ def topology_burn_in(
         "moves": moves_done,
         "accepted": accepted_total,
         "proposed": proposed_total,
+        "target_accepts_per_vertex": target_accepts_per_vertex,
         "metric_history": metric_history,
         "calibration": calibration,
     }
@@ -1649,11 +1827,14 @@ def generate_lsu_network(
     relax_global_iters: int = 500,
     global_fallback_threshold: float = float("inf"),
     local_shell_depth: Optional[int] = 4,
-    seed_lattice: str = "diamond3",
+    seed_lattice: str = "srs",
     seed_jitter_sigma: float = 0.10,
     strict_tiling: bool = False,
     topology_burn_in_moves: int = 20_000,
     topology_burn_in_T: Optional[float] = None,
+    topology_burn_in_target_accepts_per_vertex: Optional[float] = 4.0,
+    uniformity_weight: float = 10.0,
+    uniformity_kmax: int = 2,
     seed: int = 42,
     use_jax: Optional[bool] = None,
     use_jaxopt: bool = False,
@@ -1741,11 +1922,16 @@ def generate_lsu_network(
         toward each other under the bonded-only Sellers energy).
     seed_lattice : str
         Crystalline Z=3 lattice used as the WWW seed. Currently supports
-        ``'diamond3'`` (default): cubic diamond topology with a perfect
+        ``'srs'`` (default): the single-network gyroid net, with 8 vertices
+        per cubic cell, 120-degree bond angles, and bond length
+        ``a*sqrt(2)/4``. This is the crystalline parent of the amorphous
+        gyroid and matches Hemmann/Saba's Z=3 gyroid starting point.
+        ``'diamond3'`` is also available: cubic diamond topology with a perfect
         matching of 4 bonds removed per cubic cell to drop from Z=4 to
-        Z=3; 8 vertices per cubic cell, all bond lengths equal. Replaces
-        the legacy Barkema-Mousseau random seeder which produced long
-        chord stragglers (3–5·d0) and seeded void clustering. See
+        Z=3; 8 vertices per cubic cell, all bond lengths equal, but with
+        tetrahedral 109.47-degree angles. Replaces the legacy
+        Barkema-Mousseau random seeder which produced long chord stragglers
+        (3–5·d0) and seeded void clustering. See
         ``crystal_seed_network`` for details.
     seed_jitter_sigma : float
         Std-dev of Gaussian position jitter added to the crystalline
@@ -1766,8 +1952,23 @@ def generate_lsu_network(
         4^3-voxel-density std plateaus. See ``topology_burn_in``.
     topology_burn_in_T : float or None
         Temperature for the burn-in. None (default) auto-calibrates via
-        a short probe sweep to ~70% acceptance. A user-supplied value
-        skips calibration; pick large enough to keep acceptance > 50%.
+        a short probe sweep to modest acceptance near melting. A user-supplied
+        value skips calibration.
+    topology_burn_in_target_accepts_per_vertex : float or None
+        Stop the burn-in once accepted Stone-Wales moves have involved each
+        vertex this many times on average (each accepted move involves four
+        vertices). Default 4.0 prevents the high-T burn-in from over-randomising
+        the network into the large-pore regime Hemmann/Saba diagnose. Set
+        ``None`` to use ``topology_burn_in_moves`` as the only cap.
+    uniformity_weight : float
+        Weight of a low-k vertex structure-factor penalty added to the
+        Metropolis acceptance objective. The local Sellers geometry energy is
+        still used for L-BFGS relaxation; this term only rejects topology moves
+        that amplify long-wavelength density fluctuations / voids. Default 10.0.
+        Set 0.0 for strict Sellers Eq. 2 acceptance.
+    uniformity_kmax : int
+        Integer reciprocal-space shell used by the uniformity penalty. Default
+        2 averages over 32 lowest nonzero modes in a cubic box.
     seed : int
         Random seed for reproducibility.
     use_jax : bool, optional
@@ -1864,7 +2065,7 @@ def generate_lsu_network(
               f"jaxopt={'on' if use_jaxopt_eff else 'off'}")
 
     # Seed network -----------------------------------------------------------
-    # Crystalline Z=3 seed (default: diamond-minus-matching, 'diamond3').
+    # Crystalline Z=3 seed (default: gyroid/srs).
     # Replaces the legacy Barkema-Mousseau random seeder which produced
     # long chord stragglers (3–5*d0) for the few isolated degree-2
     # vertices, then dragged vertices across the cell during the initial
@@ -1920,6 +2121,9 @@ def generate_lsu_network(
             relax_global_iters=relax_global_iters,
             local_shell_depth=local_shell_depth,
             global_fallback_threshold=global_fallback_threshold,
+            uniformity_weight=uniformity_weight,
+            uniformity_kmax=uniformity_kmax,
+            target_accepts_per_vertex=topology_burn_in_target_accepts_per_vertex,
             use_jax=use_jax, use_jaxopt=use_jaxopt_eff,
             verbose=verbose,
         )
@@ -1943,6 +2147,8 @@ def generate_lsu_network(
         relax_global_every=relax_global_every,
         global_fallback_threshold=global_fallback_threshold,
         local_shell_depth=local_shell_depth,
+        uniformity_weight=uniformity_weight,
+        uniformity_kmax=uniformity_kmax,
         check_lsu_every=check_lsu_every,
         use_jax=use_jax, use_jaxopt=use_jaxopt_eff, verbose=verbose,
     )
@@ -1978,6 +2184,10 @@ def generate_lsu_network(
         print(f"[gen] rod lengths: mean={rod_lengths.mean():.3f}, "
               f"std={rod_lengths.std():.3f}, "
               f"min={rod_lengths.min():.3f}, max={rod_lengths.max():.3f}")
+        print(f"[gen] uniformity: voxel_std(4^3)="
+              f"{_voxel_density_std(positions, box, ngrid=4):.3f}, "
+              f"S_low(k<={uniformity_kmax})="
+              f"{low_k_structure_factor(positions, box, uniformity_kmax):.4g}")
         if pbc_duplicate_boundary_rods:
             n_extra = rods.shape[0] - num_rods
             print(f"[gen] rendered {rods.shape[0]} rods "

@@ -27,9 +27,10 @@
 | `energy_weights`     | dict or None    | {'alpha':α, 'beta':β, 'gamma':γ, 'delta':δ}.           |
 | `target_tolerance`   | float           | Stop early if measured LSU is within this of target.   |
 | `check_lsu_every`    | int             | How often (in WWW iters) to measure LSU.               |
-| `seed_lattice`       | str             | Crystalline Z=3 seed: ``'diamond3'`` (default).        |
-|                      |                 | Cubic diamond minus a 4-bond matching, 8 vertices/cubic|
-|                      |                 | cell. Replaces the legacy BM random seeder.            |
+| `seed_lattice`       | str             | Crystalline Z=3 seed: ``'srs'`` (default).             |
+|                      |                 | Single-network gyroid, 8 vertices/cubic cell, 120°     |
+|                      |                 | bond angles. ``'diamond3'`` remains available for      |
+|                      |                 | diagnostics. Replaces the legacy BM random seeder.     |
 | `seed_jitter_sigma`  | float           | Gaussian jitter on seed positions, in units of d0.     |
 |                      |                 | Default 0.10. Breaks exact lattice symmetry.           |
 | `strict_tiling`      | bool            | If True, raise when N is not exactly tilable by the    |
@@ -38,7 +39,13 @@
 |                      |                 | production annealing to lose crystalline memory.       |
 |                      |                 | Default 20_000. Set 0 to skip.                         |
 | `topology_burn_in_T` | float or None   | Temperature for the burn-in. None (default) auto-      |
-|                      |                 | calibrates via a probe sweep to ~70% acceptance.       |
+|                      |                 | calibrates via a probe sweep to modest acceptance.     |
+| `topology_burn_in_target_accepts_per_vertex` | float/None | Burn-in accepted-move cap measured as |
+|                      |                 | vertex involvements per vertex. Default 4.0.           |
+| `uniformity_weight`  | float           | Low-k structure-factor penalty weight in Metropolis    |
+|                      |                 | acceptance. Default 10.0; set 0.0 for strict Sellers   |
+|                      |                 | local-energy acceptance.                               |
+| `uniformity_kmax`    | int             | Reciprocal shell for uniformity penalty. Default 2.    |
 
 ## Output
 

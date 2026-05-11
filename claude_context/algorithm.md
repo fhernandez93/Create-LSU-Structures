@@ -8,7 +8,7 @@ Following Sellers et al., Nat. Commun. 8, 14439 (2017) and its supplement.
   (so N must be even, and num_rods must be a multiple of 3).
 - The cell is periodic; all vector quantities use minimum-image PBC.
 
-## 1.5. Seed network — crystalline Z=3 seed + WWW burn-in
+## 1.5. Seed network — srs crystalline Z=3 seed + controlled WWW burn-in
 The pipeline now follows the Hemmann/Saba 2026 recipe (Adv. Funct. Mater.,
 PDF in `LSU Literature/`): start from a **periodic Z=3 crystalline net**
 and run a high-T constant-temperature **WWW Stone-Wales "burn-in"** to lose
@@ -34,17 +34,13 @@ relax — the void-clustering mechanism documented in
 1. **Build the crystalline lattice** (`crystal_seed_network`): pick the
    tile (nx, ny, nz) so that `vertices_per_cell · nx·ny·nz ≈ N` (rounds
    to nearest valid N; pass `strict_tiling=True` to raise instead).
-   Default lattice `diamond3`: the cubic diamond (Z=4) topology with a
-   perfect matching of 4 bonds removed per cubic cell to drop to Z=3.
-   8 atoms / cubic cell, all bond lengths a·sqrt(3)/4 where `a` is the
-   cubic-cell edge derived from the user's box. The matching uses each
-   of the 4 tetrahedral directions exactly once
-   ({A0-B0 d1, A1-B3 d3, A2-B1 d4, A3-B2 d2}) so the remaining graph
-   stays 3D-connected across cells. Using fewer directions splits the
-   lattice into disconnected slabs (verified by `is_connected` at the
-   end of seed construction). Bond angles are tetrahedral (109.47°),
-   not at Sellers's 120° f2 target — so SW moves are downhill on
-   average and burn-in disorders the topology quickly.
+   Default lattice `srs`: the single-network gyroid net (I4_132, 8a,
+   x=1/8), 8 vertices / cubic cell, all bond lengths `a·sqrt(2)/4`, and
+   three coplanar 120° bonds at every vertex. This is the ordered parent
+   of the amorphous gyroid and matches Hemmann/Saba's Z=3 gyroid starting
+   point. The older `diamond3` option remains available for diagnostics,
+   but it is no longer the default: at N=1000, L=11.44, d0=0.8 its seed
+   bonds are ~0.991 µm, forcing a distorting initial relax.
 2. **Position jitter**: Gaussian noise of std `jitter_sigma · d0`
    (default 0.10) breaks exact symmetry so the first SW moves see a
    non-degenerate Hessian.
@@ -53,13 +49,20 @@ relax — the void-clustering mechanism documented in
    the jitter. For N=1000 / box=11.44 / d0=0.8 this lands all bonds at
    ~d0 with std 0.0 (perfect lattice), φ_22 = 1.0000.
 4. **Topology burn-in** (`topology_burn_in`): constant-T WWW with no
-   LSU target. T is auto-calibrated by a 200-move probe sweep to reach
-   ~70% acceptance (default), or user-supplied via `topology_burn_in_T`.
-   Runs in chunks of `plateau_window` moves; stops early when the
-   4^3-voxel-density std plateaus (relative std of last three chunk
-   metrics below 5%). Default `topology_burn_in_moves=20_000` (~28 min
-   on GPU at 84 ms/relax for N=1000). Uses the existing JAX-jitted
-   value_and_grad kernel — burn-in IS the GPU hot loop.
+   LSU target. T is auto-calibrated by a 200-move probe sweep to a modest
+   acceptance near melting (~20% by default), or user-supplied via
+   `topology_burn_in_T`. The burn-in also stops when accepted moves have
+   involved each vertex `topology_burn_in_target_accepts_per_vertex`
+   times on average (default 4.0; each accepted move counts four vertex
+   involvements). This replaces the older 70%-acceptance / 20k-move
+   maximum-randomization burn-in, which could overrun into Hemmann's
+   large-pore regime.
+5. **Long-wavelength uniformity guard**: `uniformity_weight` adds a
+   low-k vertex structure-factor penalty to the Metropolis acceptance
+   objective. The L-BFGS relaxation still minimizes the Sellers local
+   geometry energy; this acceptance term rejects topology moves that
+   amplify box-scale density fluctuations / voids. Set
+   `uniformity_weight=0.0` for strict Sellers Eq. 2 acceptance.
 
 ## 2. Energy (Supplement, Eq. 2)
     U = α f1({d}) + β f2({θ}) + γ f3({φ}) + δ f4({χ})

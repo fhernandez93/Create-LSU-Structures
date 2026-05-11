@@ -12,6 +12,15 @@ type: reference
 - Their energy (Eq. 4): `E = (3/16) Σ_(ij) (r_ij²−1)² + (3/8) β Σ_(jik) (r_ij·r_ik · cos θ_jik + 1)²`. Two-body bond stretch + three-body **bonded** bond bending. **No non-bonded vertex-repulsion term.**
 - Their "angle-dependent repulsion" is between *bond directions sharing a vertex* (equilibrium angle 180° for arbitrary Z), not between non-bonded vertices. For Z=3 specifically the ground-state geometry is the same as Sellers's f2 with target 120° (frustrated equilateral triangle); the Hemmann modification gains nothing structural for our Z=3 case.
 - They explicitly observe and characterise vertex/void clustering with dedicated metrics (`r_u`, `δ_c`); Figure 8c shows critical pore radius growing monotonically with accepted MC moves *for all β values*. Their fix is **algorithmic**: operate near the melting transition (1.0 ≲ T_max/T_melt ≲ 1.3) with relatively few accepted moves, plus the Vink/MB local-shell relaxation scheme.
+- For the Z=3 gyroid case they use the periodic `srs` net as the crystalline
+  starting point. `srs` is the correct ordered parent for Sellers amorphous
+  gyroids; a generic Z=3 crystal is less faithful even if it is connected and
+  trivalent.
+- Because they note that local Keating-like energies do not directly control
+  pore size / hyperuniformity, the implementation now includes an optional
+  low-k structure-factor penalty in Metropolis acceptance (`uniformity_weight`,
+  default 10.0). This is a deliberate long-range uniformity guard; set it to
+  0.0 for strict Sellers Eq. 2 acceptance.
 - They do **not** use the Sellers LSU statistic Φ_nl. They use 12 quantifiers across direct space (`σ_r`, `σ_θ`, `r_nn`, `r_u`, `δ_c`, ring statistics) and reciprocal space (structure factor, hyperuniformity exponent α). LSU evaluation in our pipeline remains independent of their work.
 - (Earlier memory entry incorrectly said Hemmann adds non-bonded vertex repulsion. They don't. Cite this paper as published precedent for the Vink/MB local-shell relaxation, not for an added energy term.)
 

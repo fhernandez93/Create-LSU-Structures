@@ -1,5 +1,5 @@
 - [User role](user_role.md) — PhD student building photonic LSU networks; knows the literature, addresses by ref number.
-- [LSU known issues](project_known_issues.md) — void clustering resolved 2026-05-11 by crystal-seed rewrite; old fixes (local-shell + fallback gate) retained as belt-and-suspenders; bond-collapse secondary.
-- [Seed-network rewrite](project_seed_network_rewrite.md) — 2026-05-11: BM random seeder removed; new `crystal_seed_network` (diamond3) + `topology_burn_in` per Hemmann/Saba 2026 and Sellers refs [27,28].
+- [LSU known issues](project_known_issues.md) — void clustering required a second 2026-05-11 fix: true `srs` seed, capped burn-in, and low-k uniformity penalty; old local-shell + fallback gate retained; bond-collapse secondary.
+- [Seed-network rewrite](project_seed_network_rewrite.md) — 2026-05-11: BM random seeder removed; new `crystal_seed_network` (default `srs`) + capped `topology_burn_in` + `uniformity_weight` per Hemmann/Saba 2026 and Sellers refs [27,28].
 - [LSU literature anchors](reference_lsu_literature.md) — no published {α,β,γ,δ} for Sellers four-term U; Sellers cites Vink/MB 2001 for relax refinements (4-shell local); Hemmann/Saba 2026 has no non-bonded vertex repulsion (corrected); Si Keating β/α≈0.285.
 - [Rod count convention](project_rod_count_convention.md) — reference file is N=1000/E=1500 with 153 PBC-image duplicates (1653 lines); use `num_vertices=1000` to match; `pbc_duplicate_boundary_rods=True` default required for downstream periodicity.

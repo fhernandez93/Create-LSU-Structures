@@ -9,6 +9,7 @@ gyroid family) for downstream FDTD-style simulations. Comfortable with the under
 (Wooten-Winer-Weaire, Barkema-Mousseau, Keating potential, dihedral / skew terms), reads source PDFs,
 and points to specific reference numbers when asking for changes — write at that level.
 
-Project sits at `h:\phd stuff\Create LSU Structures  - Claude` on Windows, runs in PowerShell, JAX is
-CPU-only (no GPU). Pipeline: `lsu_network.generate_lsu_network` → `(N,6)` rod-endpoint array →
+Project currently sits at `/home/francisco/Documents/Create LSU Structures  - Claude` in this workspace
+(historically `h:\phd stuff\Create LSU Structures  - Claude` on Windows). User now reports GPU resources.
+Pipeline: `lsu_network.generate_lsu_network` → `(N,6)` rod-endpoint array →
 `create_permittivity_grid_penlike` (in `20250903_create_h5_from_ends.ipynb`) → HDF5.

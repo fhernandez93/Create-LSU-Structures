@@ -40,10 +40,10 @@ target value (Φ_12 or Φ_22).
   available for the energy + gradient and is much faster on CPU/GPU.
 - LSU computation supports Φ_12 (depth 1) fully and Φ_22 (depth 2) using a
   greedy edge-alignment heuristic per the paper's depth-first search description.
-- Initial seed: Barkema-Mousseau (PRB 62, 4985, 2000) hard-core uniform
-  vertex placement followed by greedy proximity bonds with BM loop-expansion
-  repair. Implemented in `bm_initial_network`. The legacy configuration-model
-  path is in `random_3regular_graph` but is not used by default.
+- Initial seed: true `srs` single-network gyroid crystal by default, followed
+  by a capped WWW burn-in and low-k uniformity guard. The legacy BM/random
+  seeders were removed because they produced poor seed quality for downstream
+  FDTD work.
 - Output: rods are written with one endpoint inside the canonical box and the
   other endpoint placed by minimum-image displacement, matching the example.
 

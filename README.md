@@ -8,39 +8,28 @@ Following Sellers et al., Nat. Commun. 8, 14439 (2017) and its supplement.
   (so N must be even, and num_rods must be a multiple of 3).
 - The cell is periodic; all vector quantities use minimum-image PBC.
 
-## 1.5. Seed network — Barkema-Mousseau (PRB 62, 4985, 2000) §II.A
-The Sellers supplement Methods cites Vink 2001 / Mousseau-Barkema 2001, both built
-on the Barkema-Mousseau 2000 procedure. The configuration model (random pairing of
-labelled stubs, then positions assigned uniformly afterwards) is what BM explicitly
-reject — it leaves long-range "memory-less" bonds that produce empty regions and a
-heavy-tailed bond-length distribution after relaxation.
+## 1.5. Seed network — srs crystalline seed + controlled WWW burn-in
+The current implementation follows the Hemmann/Saba 2026 reading of WWW:
+start from a periodic crystalline network with the desired coordination, then
+use Stone-Wales moves to disorder topology. For amorphous gyroids the natural
+Z=3 parent is the single-network gyroid (`srs`) net, not a generic trivalent
+crystal.
 
-BM §II.A targets *tetravalent* (Si) networks via a single loop visiting each atom
-twice. For our trivalent case the loop visits each atom once and a chord matching
-lifts every vertex from degree 2 to degree 3.
+Implemented in `crystal_seed_network` / `topology_burn_in`:
 
-Implemented in `bm_initial_network` / `_build_trivalent_proximity_graph`:
-
-1. **Hard-core placement** (`poisson_disk_pbc`, BM §II.A): N vertices placed
-   uniformly in [-L/2, L/2]^3 with PBC under a minimum-image separation
-   `r_min = 0.7·d0` (the Si analogue is 2.3 Å for d0 = 2.35 Å). The constraint
-   softens by 5% on excess rejection rate.
-2. **Stage A — Hamiltonian-like cycle via BM loop expansion**:
-   - Seed with a triangle of 3 mutually-close vertices.
-   - Iteratively insert each remaining vertex `A` into an existing edge
-     `(B, C)` when `dist(A, B), dist(A, C) ≤ r_cut = 1.7·d0`, replacing
-     `(B, C)` with `(A, B), (A, C)`. This is the BM elementary "+1 edge" move
-     (their Fig. 1) — A goes from degree 0 to 2; B, C stay at 2.
-   - Fallback: if no valid `(B, C)` exists for any remaining `A`, bond `A` to
-     its two nearest neighbours that still have degree < 3. May saturate
-     those neighbours to degree 3 a step early; Stage B then issues fewer
-     chords.
-3. **Stage B — Chord matching to degree 3**: repeatedly add the shortest
-   unbonded pair of degree-2 vertices. If the shortest valid pair lies
-   beyond `r_cut`, take it anyway — relaxation will pull it in.
-4. Outer loop in `bm_initial_network`: for each `r_cut` value try
-   `layouts_per_cutoff = 4` independent Poisson-disk layouts before
-   widening `r_cut` by 8%.
+1. **srs crystalline seed**: 8 vertices per cubic cell, all bonds length
+   `a·sqrt(2)/4`, and three 120° bonds at every vertex. For the Sellers
+   reference size (`N=1000`, `L=11.44`, `d0=0.8`) this gives initial bonds of
+   ~0.809 µm, close to the target length.
+2. **Initial L-BFGS**: settles jitter and pulls the seed exactly onto `d0`.
+3. **Controlled burn-in**: constant-T WWW with no LSU target. Temperature is
+   auto-calibrated to modest acceptance near melting, then burn-in stops once
+   accepted Stone-Wales moves have involved each vertex a capped number of
+   times (`topology_burn_in_target_accepts_per_vertex`, default 4.0).
+4. **Long-wavelength uniformity guard**: during Metropolis acceptance,
+   `uniformity_weight` penalizes low-k vertex structure factor so density
+   modes that produce large voids are rejected. L-BFGS still minimizes the
+   Sellers local geometry energy.
 
 ## 2. Energy (Supplement, Eq. 2)
     U = α f1({d}) + β f2({θ}) + γ f3({φ}) + δ f4({χ})
@@ -73,13 +62,16 @@ reasonable starting point; user can tune.
    d ≠ c, must not be already adjacent to either).
 3. Stone-Wales / bond transposition: remove edges (i, c) and (j, d); add edges
    (i, d) and (j, c). This preserves trivalence.
-4. Locally relax positions of vertices in the 1- or 2-neighborhood of {i, j} to
-   minimize U for the new topology.
-5. Compute ΔE = U_new − U_old.
+4. Locally relax positions of vertices within the Vink/Mousseau-Barkema
+   fourth-neighbour shell of the Stone-Wales move to minimize U for the new
+   topology.
+5. Compute ΔE from the relaxed Sellers energy plus the optional low-k
+   uniformity penalty.
 6. Accept with probability P_a = min(1, exp(−ΔE / T)) (Eq. 1 of supplement).
 7. Cool T according to a schedule (geometric decay).
 
-Periodic global relaxations every K accepted moves clean up accumulated drift.
+Fixed-schedule global relaxations are disabled by default because they
+re-introduce void drift under the bonded-only local energy.
 
 ## 4. LSU statistic
 For each vertex pair (a, b) with b within `locality` edges of a:

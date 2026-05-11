@@ -10,9 +10,10 @@
 4. **Crystalline Z=3 seed** —
    - `_LATTICE_LIBRARY` — dict of named periodic Z=3 networks. Each entry
      has `sites_frac`, `bonds` (with PBC offsets), `cell_aspect`,
-     `target_bond_frac`, `vertices_per_cell`. Default: `'diamond3'` —
-     cubic diamond minus a 4-bond perfect matching (8 vertices/cubic
-     cell, all bonds length `a·sqrt(3)/4`).
+     `target_bond_frac`, `vertices_per_cell`. Default: `'srs'` —
+     single-network gyroid (8 vertices/cubic cell, all bonds length
+     `a·sqrt(2)/4`, 120° trihedral angles). `'diamond3'` remains as a
+     diagnostic alternative but is no longer the default.
    - `_pick_tile_dims` — picks (nx, ny, nz) so total N matches the request
      (or warns and rounds; raises with `strict_tiling=True`).
    - `crystal_seed_network` — tiles the lattice, applies Gaussian
@@ -69,9 +70,15 @@
      geometric temperature schedule and periodic full relaxations. Uses one
      long-lived `_RelaxContext`.
    - `topology_burn_in(...)` — thin wrapper over `www_anneal` with constant T
-     and no LSU target. Auto-calibrates T via a probe sweep to ~70% acceptance.
-     Stops early when the 4^3-voxel-density std plateaus. Run before the
-     production WWW loop to destroy crystalline memory of the seed.
+     and no LSU target. Auto-calibrates T via a probe sweep to modest
+     acceptance (~20% default), stops when accepted Stone-Wales moves have
+     involved each vertex a capped number of times, and also tracks
+     4^3-voxel-density std. Run before the production WWW loop to destroy
+     crystalline memory without over-randomising into large pores.
+   - `low_k_structure_factor(...)` — cheap large-scale uniformity metric used
+     by `www_anneal` when `uniformity_weight > 0`. The penalty is included in
+     Metropolis acceptance only; local L-BFGS still minimizes Sellers's local
+     geometry energy.
 10. **LSU computation** —
    - `_build_tree(vertex, depth, neighbors, positions, box)` — BFS to depth n,
      storing edge vectors in unwrapped local frame.
@@ -147,10 +154,10 @@ process per (N, n_edges) pair.
 ## Notes / gotchas
 - `jax_enable_x64=True` is set process-wide. Any other JAX code in the same
   interpreter will also default to float64.
-- BM initial network requires the box to support a hard-core packing of N
-  vertices at separation `0.7·d0`. Density `N/L³` should be at most
-  `~1/d0³` (gyroid-like packing). The Sellers example sits at
-  N/L³ = 1102/1497 ≈ 0.74 vertices/µm³, well within the limit.
+- The legacy BM initial network and Poisson-disk hard-core packing path have
+  been removed. If a seed warning appears now, it is almost always the
+  crystalline cell's bond length being inconsistent with `edge_length`; for
+  the default srs seed use `d0 ≈ (box[0]/nx)*sqrt(2)/4`.
 - **Bond collapse**: the Sellers energy (Eq. 2 in the supplement) has no
   explicit non-bonded repulsion, only the Keating bond-stretch term f1.
   After many SW moves L-BFGS sometimes settles into a local minimum where

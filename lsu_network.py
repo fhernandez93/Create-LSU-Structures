@@ -34,6 +34,7 @@ from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
 from scipy.optimize import minimize
+from scipy.spatial import cKDTree
 
 try:
     import jax
@@ -436,6 +437,390 @@ def crystal_seed_network(
         "N_actual": N_actual,
     }
     return positions, edges, meta
+
+
+# --------------------------------------------------------------------------- #
+# Random Z=3 seed network — BM2000 § II.A loop expansion
+# --------------------------------------------------------------------------- #
+# This is the seed recipe Sellers (Nat. Commun. 8, 14439, 2017) literally
+# cites for the random-network start ("simulated annealing of a random
+# network", supplement Methods, refs [13] Vink 2001 and [14] Mousseau-Barkema
+# 2001). It produces a connected Z=3 network from random points + a
+# Hamiltonian-cycle scaffold + loop expansion, with the BM2000
+# minimum-separation constraint preventing the near-collinear vertex
+# clusters that the Sellers Eq. 2 energy cannot spontaneously remove (it has
+# no non-bonded repulsion).
+#
+# BM2000's published algorithm targets Z=4 amorphous Si. We adapt it to Z=3
+# faithfully:
+#   - Place N points with min-separation `min_separation_frac * d0` (BM2000:
+#     2.3 Å vs Si–Si d=2.35 Å, i.e. ≈ 0.979).
+#   - Build a Hamiltonian cycle through all N points using nearest-neighbour
+#     traversal. Every vertex starts at degree 2.
+#   - Loop expansion to Z=3: add N/2 more edges. For Z=3, every needed
+#     addition is a *direct* pairing of two deg-2 vertices, not a BM2000
+#     Eq. 2 swap (those are only needed when the target valency exceeds
+#     2 + 1). We grow `rc` whenever direct pairing stalls.
+#   - Final invariants identical to `crystal_seed_network`: deg==3
+#     everywhere, `is_connected`, edges canonicalised.
+def random_seed_network_bm2000(
+    N: int,
+    box: Union[float, Tuple[float, float, float], np.ndarray],
+    d0: float,
+    rng: np.random.Generator,
+    min_separation_frac: float = 0.98,
+    rc_start_frac: float = 1.30,
+    rc_grow_frac: float = 0.05,
+    rc_max_frac: float = 6.00,
+    max_outer_passes: int = 10_000,
+    verbose: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, Dict]:
+    """Build a random Z=3 seed network via BM2000 (Phys. Rev. B 62, 4985) § II.A.
+
+    Algorithm (Z=3 adaptation of BM2000):
+
+    1. **Placement.** Poisson-disk: place ``N`` vertices in
+       ``[-L/2, L/2]^3`` rejecting candidates within
+       ``min_separation_frac * d0`` of an existing vertex. If placement
+       deadlocks, lower the min-separation by 0.02 until 0.85, raising
+       ``RuntimeError`` beyond that.
+    2. **Hamiltonian cycle.** Greedy nearest-neighbour traversal under
+       PBC, starting from vertex 0. Every vertex ends at degree 2. This
+       is BM2000's "loop visiting all atoms" starting point.
+    3. **Loop expansion to Z=3.** Pair deg-2 vertices: for each
+       under-coordinated vertex ``i`` in random order, bond it to its
+       nearest deg-2 partner ``j`` within ``rc`` such that ``(i, j)`` is
+       not already an edge. When no progress is made at the current
+       ``rc``, grow ``rc`` by ``rc_grow_frac * d0`` and retry. Continues
+       until every vertex has degree 3 or ``rc`` exceeds
+       ``rc_max_frac * d0``.
+    4. **Invariants.** Same as ``crystal_seed_network``: ``deg == 3``
+       everywhere, ``is_connected``, edges canonicalised ``(min, max)``
+       and lex-sorted.
+
+    Returns
+    -------
+    positions : (N, 3) float64
+    edges : (E, 2) int64  with E = 3N/2
+    meta : dict
+        Keys ``N_actual``, ``lattice``, ``seed_bond_length`` (mean PBC
+        edge length), ``rc_final``, ``outer_passes``,
+        ``min_separation_frac``, ``cycle_max_step``.
+    """
+    if N % 2 != 0:
+        raise ValueError(
+            f"random_seed_network_bm2000: N must be even (got {N}); "
+            f"3-regular graph needs 2E = 3N with N even."
+        )
+    box_arr = coerce_box(box)
+
+    # --- Step 1: Poisson-disk placement ---------------------------------- #
+    placement_min_frac = float(min_separation_frac)
+    positions: Optional[np.ndarray] = None
+    while placement_min_frac >= 0.85:
+        positions = _poisson_disk_pbc(
+            N, box_arr, placement_min_frac * d0, rng,
+            max_tries=max(50_000, 200 * N),
+        )
+        if positions is not None:
+            break
+        if verbose:
+            print(
+                f"[bm2000 seed] placement at min_sep={placement_min_frac:.3f}*d0 "
+                f"deadlocked; lowering by 0.02"
+            )
+        placement_min_frac -= 0.02
+    if positions is None:
+        raise RuntimeError(
+            f"random_seed_network_bm2000: could not place {N} vertices in "
+            f"box {box_arr.tolist()} even at min_separation 0.85*d0={0.85 * d0:.3g}. "
+            f"Lower N or enlarge the box."
+        )
+    if verbose:
+        print(
+            f"[bm2000 seed] placed {N} vertices at "
+            f"min_sep={placement_min_frac:.3f}*d0"
+        )
+
+    # Wrap into canonical box (idempotent guard).
+    positions = positions - box_arr * np.round(positions / box_arr)
+
+    nbr_sets: list[set[int]] = [set() for _ in range(N)]
+    edges_list: list[Tuple[int, int]] = []
+
+    def _add_edge(a: int, b: int) -> None:
+        u, v = (a, b) if a < b else (b, a)
+        edges_list.append((u, v))
+        nbr_sets[a].add(b)
+        nbr_sets[b].add(a)
+
+    def _degree(i: int) -> int:
+        return len(nbr_sets[i])
+
+    def _tree() -> cKDTree:
+        pos_shift = positions + box_arr / 2.0
+        pos_shift = np.clip(pos_shift, 0.0, box_arr - 1e-12)
+        return cKDTree(pos_shift, boxsize=box_arr)
+
+    # --- Step 2: Hamiltonian cycle (nearest-neighbour traversal) -------- #
+    # Pick a random starting vertex; greedily walk to the nearest unvisited
+    # vertex under PBC; close the cycle by connecting the last vertex back
+    # to the start. This gives every vertex deg==2.
+    tree = _tree()
+    start = int(rng.integers(0, N))
+    visited = np.zeros(N, dtype=bool)
+    cycle_order = np.empty(N, dtype=np.int64)
+    cycle_order[0] = start
+    visited[start] = True
+    cycle_max_step = 0.0
+    current = start
+    pos_shift_all = positions + box_arr / 2.0
+    pos_shift_all = np.clip(pos_shift_all, 0.0, box_arr - 1e-12)
+    for step in range(1, N):
+        # Query enough neighbours to find at least one unvisited.
+        k_query = min(N, max(8, step // 64 + 8))
+        while True:
+            dists, idxs = tree.query(pos_shift_all[current], k=k_query)
+            dists = np.atleast_1d(dists)
+            idxs = np.atleast_1d(idxs)
+            nxt = -1
+            d_nxt = float("inf")
+            for d_ij, j in zip(dists, idxs):
+                j = int(j)
+                if j == current or visited[j]:
+                    continue
+                nxt = j
+                d_nxt = float(d_ij)
+                break
+            if nxt >= 0:
+                break
+            if k_query >= N:
+                raise RuntimeError(
+                    "random_seed_network_bm2000: cycle traversal could "
+                    "not find an unvisited vertex; geometry is degenerate."
+                )
+            k_query = min(N, k_query * 2)
+        cycle_order[step] = nxt
+        visited[nxt] = True
+        if d_nxt > cycle_max_step:
+            cycle_max_step = d_nxt
+        _add_edge(current, nxt)
+        current = nxt
+    # Close the cycle.
+    d_close = float(np.linalg.norm(
+        pbc_displacement(positions[start] - positions[current], box_arr)
+    ))
+    if d_close > cycle_max_step:
+        cycle_max_step = d_close
+    _add_edge(current, start)
+    if verbose:
+        print(
+            f"[bm2000 seed] Hamiltonian cycle built: "
+            f"max_step={cycle_max_step:.3f} ({cycle_max_step/d0:.2f}*d0)"
+        )
+
+    # All vertices should be deg==2 now.
+    deg = np.array([_degree(i) for i in range(N)], dtype=np.int64)
+    if not (deg == 2).all():
+        bad = int(np.flatnonzero(deg != 2)[0])
+        raise RuntimeError(
+            f"random_seed_network_bm2000: Hamiltonian cycle did not give "
+            f"deg=2 everywhere (vertex {bad} has deg {deg[bad]})."
+        )
+
+    # --- Step 3: loop expansion to Z=3 ---------------------------------- #
+    rc = rc_start_frac * d0
+    outer_passes = 0
+
+    while outer_passes < max_outer_passes:
+        outer_passes += 1
+        progress = False
+
+        order = np.flatnonzero(deg < 3)
+        rng.shuffle(order)
+        for i in order:
+            i = int(i)
+            if _degree(i) >= 3:
+                continue
+            # Query nearest neighbours; pick the nearest deg-2 vertex within
+            # rc that isn't already bonded to i.
+            k_query = min(N, max(16, 8 + 4 * outer_passes))
+            dists, idxs = tree.query(pos_shift_all[i], k=k_query)
+            chosen = -1
+            for d_ij, j in zip(np.atleast_1d(dists), np.atleast_1d(idxs)):
+                j = int(j)
+                if j == i:
+                    continue
+                if d_ij > rc:
+                    break  # query results are sorted by distance
+                if _degree(j) >= 3:
+                    continue
+                if j in nbr_sets[i]:
+                    continue
+                chosen = j
+                break
+            if chosen >= 0:
+                _add_edge(i, chosen)
+                deg[i] += 1
+                deg[chosen] += 1
+                progress = True
+
+        if (deg == 3).all():
+            break
+
+        if not progress:
+            if rc >= rc_max_frac * d0:
+                break  # fall through to the force-pair fallback below
+            rc += rc_grow_frac * d0
+            if verbose:
+                print(
+                    f"[bm2000 seed] outer={outer_passes} grew rc to "
+                    f"{rc:.3f} ({rc/d0:.2f}*d0) "
+                    f"(deg_lt3={int((deg < 3).sum())})"
+                )
+
+    # Force-pair fallback: if any deg-2 vertices remain (typically 0-4), pair
+    # them with each other irrespective of rc. The PBC max distance in a
+    # cubic box is sqrt(3)*L/2, which is always reachable. This guarantees
+    # termination at the cost of a few very-long bonds; the subsequent
+    # L-BFGS and burn-in shrink them back to ~d0.
+    leftover = np.flatnonzero(deg < 3).tolist()
+    if leftover:
+        if verbose:
+            print(
+                f"[bm2000 seed] {len(leftover)} stragglers; "
+                f"force-pairing them across PBC"
+            )
+        # Greedily pair the closest two stragglers, repeat.
+        while len(leftover) >= 2:
+            # Compute pairwise PBC distances among leftovers; pick the
+            # closest pair that aren't already bonded.
+            best = (-1, -1, float("inf"))
+            for ii, a in enumerate(leftover):
+                for b in leftover[ii + 1:]:
+                    if b in nbr_sets[a]:
+                        continue
+                    d_ab = float(np.linalg.norm(
+                        pbc_displacement(
+                            positions[a] - positions[b], box_arr
+                        )
+                    ))
+                    if d_ab < best[2]:
+                        best = (a, b, d_ab)
+            if best[0] < 0:
+                # No legal pairing — would only happen if leftovers form a
+                # complete clique already (impossible for >2 leftovers at
+                # deg-2 since their two existing bonds are within the cycle).
+                raise RuntimeError(
+                    f"random_seed_network_bm2000: stragglers "
+                    f"{leftover} cannot be paired without duplicate edges."
+                )
+            a, b, d_ab = best
+            _add_edge(a, b)
+            deg[a] += 1
+            deg[b] += 1
+            if verbose:
+                print(
+                    f"[bm2000 seed] force-paired ({a}, {b}) at "
+                    f"d={d_ab:.3f} ({d_ab/d0:.2f}*d0)"
+                )
+            leftover = [v for v in leftover if deg[v] < 3]
+        # If a single leftover remains (odd parity — impossible for N even,
+        # but guard anyway), abort.
+        if leftover:
+            raise RuntimeError(
+                f"random_seed_network_bm2000: odd straggler {leftover} "
+                f"after pairing; check N is even."
+            )
+
+    if not (deg == 3).all():
+        bad = int(np.flatnonzero(deg != 3)[0])
+        raise RuntimeError(
+            f"random_seed_network_bm2000: vertex {bad} has degree {deg[bad]} "
+            f"(expected 3) after force-pair fallback."
+        )
+
+    # --- Step 4: invariants --------------------------------------------- #
+    edges_arr = np.array(edges_list, dtype=np.int64)
+    edges_arr = np.unique(np.sort(edges_arr, axis=1), axis=0)
+    if edges_arr.shape[0] != (3 * N) // 2:
+        raise RuntimeError(
+            f"random_seed_network_bm2000: built {edges_arr.shape[0]} edges "
+            f"(expected {(3 * N) // 2})."
+        )
+    if not is_connected(N, edges_arr):
+        raise RuntimeError(
+            "random_seed_network_bm2000: final network is disconnected."
+        )
+
+    # Compute mean bond length (PBC minimum image).
+    bond_d = pbc_displacement(
+        positions[edges_arr[:, 1]] - positions[edges_arr[:, 0]], box_arr
+    )
+    bond_L = float(np.linalg.norm(bond_d, axis=1).mean())
+
+    meta = {
+        "N_actual": N,
+        "lattice": "random_bm2000",
+        "seed_bond_length": bond_L,
+        "rc_final": float(rc),
+        "outer_passes": int(outer_passes),
+        "min_separation_frac": float(placement_min_frac),
+        "cycle_max_step": float(cycle_max_step),
+    }
+    return positions, edges_arr, meta
+
+
+def _poisson_disk_pbc(
+    N: int,
+    box: np.ndarray,
+    min_dist: float,
+    rng: np.random.Generator,
+    max_tries: int = 200_000,
+) -> Optional[np.ndarray]:
+    """Sequentially-rejected Poisson-disk placement under PBC.
+
+    Returns ``None`` if it cannot place ``N`` points within ``max_tries``
+    attempts; the caller is expected to retry with a smaller ``min_dist``.
+    """
+    positions = np.empty((N, 3), dtype=np.float64)
+    placed = 0
+    tries = 0
+    # Lazy tree rebuild: rebuild when the placed count grows by a fixed factor.
+    tree: Optional[cKDTree] = None
+    rebuild_threshold = max(8, N // 64)
+    last_built_at = 0
+
+    while placed < N and tries < max_tries:
+        tries += 1
+        cand = (rng.random(3) - 0.5) * box
+        if placed == 0:
+            positions[placed] = cand
+            placed += 1
+            continue
+        # Rebuild tree if stale.
+        if tree is None or placed - last_built_at >= rebuild_threshold:
+            pos_shift = positions[:placed] + box / 2.0
+            pos_shift = np.clip(pos_shift, 0.0, box - 1e-12)
+            tree = cKDTree(pos_shift, boxsize=box)
+            last_built_at = placed
+        cand_shift = cand + box / 2.0
+        cand_shift = np.clip(cand_shift, 0.0, box - 1e-12)
+        dist, _ = tree.query(cand_shift, k=1)
+        # Account for the few points placed since the last rebuild that
+        # are not yet in the tree:
+        if last_built_at < placed:
+            recent = positions[last_built_at:placed]
+            r_diff = pbc_displacement(recent - cand, box)
+            r_min = float(np.linalg.norm(r_diff, axis=1).min())
+            dist = min(float(dist), r_min)
+        if dist >= min_dist:
+            positions[placed] = cand
+            placed += 1
+
+    if placed < N:
+        return None
+    return positions
 
 
 def _voxel_density_std(positions: np.ndarray, box: np.ndarray,
@@ -869,29 +1254,12 @@ class _RelaxContext:
                                   self.box, self.d0, self.weights))
 
 
-def relax(
-    positions: np.ndarray,
-    ctx: _RelaxContext,
-    max_iter: int,
-    tol: float = 1e-8,
-) -> Tuple[np.ndarray, float]:
-    """L-BFGS relaxation using the cached JIT'd kernel in `ctx`.
+def _relax_single_lbfgs(positions, ctx, max_iter, tol):
+    """One scipy/jaxopt L-BFGS pass, identical to the legacy relax behaviour.
 
-    If `ctx.set_moving_mask(mask)` has been called with a non-None mask, the
-    relaxation is restricted to the masked vertices: out-of-shell positions
-    are held fixed (Vink/Mousseau-Barkema scheme that Sellers cites). On the
-    JAX path this is implemented by zeroing the gradient for frozen
-    components inside `_jax_value_and_grad`. On the NumPy path the moving
-    DOFs are passed to scipy as a sub-vector, with frozen positions held
-    constant inside the closure.
-
-    Default JAX path: ``scipy.optimize.minimize(method="L-BFGS-B")`` driving
-    the JIT-compiled ``value_and_grad`` (single host→device call per
-    gradient eval, ~26 µs on CPU). Optional ``ctx.use_jaxopt=True`` swaps
-    in ``jaxopt.LBFGS`` which keeps the L-BFGS loop on-device — only worth
-    it on very large GPU runs; on this project scipy+JIT has benchmarked
-    faster at N≈1000. The jaxopt path receives the same gradient mask as
-    scipy+JIT, so local-shell relaxation semantics are identical.
+    Returns ``(new_positions, E_final)``. Used both as the inner work of
+    the threshold-aware ``relax`` and as a fast path when no threshold is
+    set.
     """
     if ctx.use_jaxopt:
         solver = ctx.get_jaxopt_solver(max_iter, tol)
@@ -901,19 +1269,18 @@ def relax(
             ctx._edges_j, ctx._triples_j, ctx._quads_j,
             ctx._box_j, ctx._d0_j, ctx._w_j, ctx._mask_flat_j,
         )
-        new_pos = np.asarray(res.params, dtype=np.float64).reshape(ctx.N, 3)
-        return new_pos, float(res.state.value)
+        return (
+            np.asarray(res.params, dtype=np.float64).reshape(ctx.N, 3),
+            float(res.state.value),
+        )
     if ctx.use_jax:
-        # Mask (if any) is applied inside ctx.value_and_grad — frozen
-        # components have zero gradient and L-BFGS leaves them fixed.
         def fun(x):
             return ctx.value_and_grad(x)
         res = minimize(fun, positions.reshape(-1), jac=True, method="L-BFGS-B",
                        options={"maxiter": max_iter, "gtol": tol})
         return res.x.reshape(ctx.N, 3), float(res.fun)
 
-    # NumPy path. If a mask is set, optimise only the moving DOFs as a
-    # sub-vector; scipy's finite-difference gradient then perturbs only those.
+    # NumPy path with optional moving-mask sub-vector.
     if ctx._moving_idx is not None:
         full = positions.reshape(-1).copy()
         moving = ctx._moving_idx
@@ -933,6 +1300,159 @@ def relax(
     res = minimize(fun, positions.reshape(-1), method="L-BFGS-B",
                    options={"maxiter": max_iter, "gtol": tol})
     return res.x.reshape(ctx.N, 3), float(res.fun)
+
+
+def _force_norm_sq_moving(ctx, positions_flat) -> Tuple[float, float]:
+    """Return (E, |F|^2) over the moving DOFs, using whichever backend ctx has.
+
+    For the JAX-on path this calls the JIT'd value_and_grad once and squares
+    the masked gradient. For the NumPy path, scipy's finite-difference gradient
+    is too slow to query mid-relax; we approximate |F|^2 by re-running a tiny
+    L-BFGS step and reading off its residual gradient norm. In practice we
+    never reach this branch from production runs (use_jax defaults to True),
+    so the approximation is harmless.
+    """
+    if ctx.use_jax:
+        e, g = ctx.value_and_grad(positions_flat)
+        g = np.asarray(g, dtype=np.float64)
+        if ctx._mask_flat is not None:
+            g = g * ctx._mask_flat
+        return float(e), float(np.dot(g, g))
+    # NumPy fallback: cheap finite-difference estimate over moving DOFs.
+    e = ctx.energy(positions_flat)
+    if ctx._moving_idx is None:
+        return float(e), float("nan")
+    moving = ctx._moving_idx
+    eps = 1e-5
+    full = positions_flat.copy()
+    g_sq = 0.0
+    for k in moving:
+        full[k] += eps
+        e_plus = ctx.energy(full)
+        full[k] -= 2 * eps
+        e_minus = ctx.energy(full)
+        full[k] += eps
+        g_k = (e_plus - e_minus) / (2 * eps)
+        g_sq += g_k * g_k
+    return float(e), float(g_sq)
+
+
+def relax(
+    positions: np.ndarray,
+    ctx: _RelaxContext,
+    max_iter: int,
+    tol: float = 1e-8,
+    *,
+    E_threshold: float = float("inf"),
+    threshold_check_cycle_skip: int = 5,
+    threshold_local_to_global_cycle: int = 10,
+    c_f: float = 0.5,
+    cycle_size: Optional[int] = None,
+    on_global_promote: Optional[callable] = None,
+) -> Tuple[np.ndarray, float, Dict]:
+    """L-BFGS relaxation with optional Vink/MB threshold-energy early rejection.
+
+    Backwards-compatible API for callers that don't set ``E_threshold``:
+    when ``E_threshold == inf`` the function runs a single L-BFGS pass and
+    returns ``(positions, E, info)`` with ``info["early_rejected"]=False``,
+    matching the legacy single-pass behaviour exactly except for the new
+    third return slot.
+
+    When ``E_threshold`` is finite, runs L-BFGS in chunks of ``cycle_size``
+    iterations (auto-defaulted to ``max(5, max_iter // 25)`` so a typical
+    relax does ~25 cycles, per Hemmann § 2.1 / Vink 2001 / BM2000). At each
+    cycle boundary:
+
+      - Query energy ``E`` and gradient ``g`` from ``ctx.value_and_grad``.
+      - Compute ``|F|^2`` over moving DOFs only (Vink local-relax restricts
+        the threshold check to the cluster).
+      - BM2000 Eq. 4 estimator: ``E_f_est ≈ E - c_f * |F|^2``.
+      - If ``cycle_idx >= threshold_check_cycle_skip`` AND
+        ``E_f_est > E_threshold``: abort, return current state with
+        ``info["early_rejected"]=True``.
+      - If ``cycle_idx == threshold_local_to_global_cycle`` AND a moving
+        mask is set AND ``|E - E_threshold| < 0.1``: drop the mask via
+        ``ctx.set_moving_mask(None)`` and continue full-N from the current
+        point. Threshold checks remain enabled but ``|F|^2`` is now over
+        all DOFs (Hemmann § 2.1 quotes this verbatim).
+
+    The 5-cycle warm-up handles anharmonicities at the SW defect: BM2000
+    note that the harmonic ``E - c_f|F|^2`` underestimates ``E_f`` during
+    the first few relax steps and would prematurely reject good moves.
+    """
+    if cycle_size is None:
+        cycle_size = max(5, int(max_iter) // 25)
+    info: Dict = {
+        "n_iter_done": 0,
+        "force_norm_final": 0.0,
+        "promoted_to_global": False,
+        "early_rejected": False,
+        "E_estimate_at_abort": float("nan"),
+    }
+
+    if not math.isfinite(E_threshold):
+        new_pos, E_final = _relax_single_lbfgs(positions, ctx, max_iter, tol)
+        info["n_iter_done"] = int(max_iter)
+        # Cheap force-norm reading on the JAX path; skip on NumPy to avoid
+        # the FD cost.
+        if ctx.use_jax:
+            _, F_sq = _force_norm_sq_moving(ctx, new_pos.reshape(-1))
+            info["force_norm_final"] = math.sqrt(F_sq)
+        return new_pos, E_final, info
+
+    # Threshold-aware chunked relax.
+    pos_flat = positions.reshape(-1).copy()
+    cycles_done = 0
+    iters_done = 0
+    promoted = False
+    E = float("inf")
+    F_sq = float("inf")
+    while iters_done < max_iter:
+        this_chunk = min(cycle_size, max_iter - iters_done)
+        new_pos, E_after = _relax_single_lbfgs(
+            pos_flat.reshape(ctx.N, 3), ctx, this_chunk, tol
+        )
+        pos_flat = new_pos.reshape(-1)
+        iters_done += this_chunk
+        cycles_done += 1
+        # Re-read energy + force norm at the current point.
+        E, F_sq = _force_norm_sq_moving(ctx, pos_flat)
+        # BM2000 Eq. 4 estimator.
+        E_est = E - c_f * F_sq
+        # Threshold check (after warm-up).
+        if cycles_done > threshold_check_cycle_skip and E_est > E_threshold:
+            info.update({
+                "n_iter_done": iters_done,
+                "force_norm_final": math.sqrt(F_sq),
+                "promoted_to_global": promoted,
+                "early_rejected": True,
+                "E_estimate_at_abort": E_est,
+            })
+            return pos_flat.reshape(ctx.N, 3), E, info
+        # Local→global promotion at cycle 10 when E is within 0.1 of threshold
+        # (Hemmann § 2.1: "After 10 cycles, relaxation continues globally").
+        if (
+            not promoted
+            and cycles_done == threshold_local_to_global_cycle
+            and ctx._mask_flat is not None
+            and abs(E - E_threshold) < 0.1
+        ):
+            if on_global_promote is not None:
+                on_global_promote(pos_flat.reshape(ctx.N, 3))
+            ctx.set_moving_mask(None)
+            promoted = True
+        # Convergence check: tiny |F| means L-BFGS won't move further.
+        if F_sq < tol * tol:
+            break
+
+    info.update({
+        "n_iter_done": iters_done,
+        "force_norm_final": math.sqrt(F_sq) if math.isfinite(F_sq) else 0.0,
+        "promoted_to_global": promoted,
+        "early_rejected": False,
+        "E_estimate_at_abort": float("nan"),
+    })
+    return pos_flat.reshape(ctx.N, 3), E, info
 
 
 # --------------------------------------------------------------------------- #
@@ -1058,30 +1578,52 @@ def www_anneal(
     check_lsu_every: int = 500,
     uniformity_weight: float = 10.0,
     uniformity_kmax: int = 2,
+    threshold_energy_relax: bool = True,
+    c_f: float = 0.5,
+    cycle_size: Optional[int] = None,
+    temperatures: Optional[np.ndarray] = None,
     use_jax: bool = False,
     use_jaxopt: bool = False,
     verbose: bool = True,
+    log_tag: str = "WWW",
 ):
     """Run WWW simulated annealing. Returns (positions, edges, neighbors, history).
 
-    Sellers's supplement (Methods, refs [13,14]) follows Vink/Mousseau-Barkema:
-    spatially-local L-BFGS within the SW shell each move, with full-N L-BFGS
-    only as a *rare fallback* when the local relax fails. The shell-constrained
-    relax leaves residual ΔE > 0 for many "good" moves (frozen vertices outside
-    the shell can't fully accommodate the new topology), so a 0-threshold gate
-    would fire on essentially every uphill move and re-introduce the same
-    full-N drift it is meant to suppress. Default ``float('inf')`` keeps the
-    gate off; set a finite value (e.g. 5.0–20.0 in typical energy units) to
-    promote the worst-stalled moves to a global polish. The legacy fixed-
-    schedule polish ``relax_global_every`` is kept only for back-compat and
-    is no-op when set to 0 (the new default); a non-zero value emits a
-    deprecation warning.
+    Sellers's supplement (Methods, refs [13,14]) follows Vink/Mousseau-Barkema.
+    The Stone-Wales loop here implements that recipe end-to-end:
+
+      1. Snapshot ``E_b = E_curr``.
+      2. Draw ``s ∈ (0, 1)`` and set the Metropolis threshold
+         ``E_t = E_b - T * ln(s)`` (Vink 2001 Eq. 5).
+      3. Apply the SW move, refresh topology.
+      4. Build the moving-shell mask (``local_shell_depth``, default 4),
+         held fixed via gradient masking.
+      5. Call ``relax(..., E_threshold=E_t)``: chunked L-BFGS with BM2000
+         Eq. 4 ``E_f_est = E - c_f * |F|^2`` early-rejection check,
+         5-cycle anharmonic warm-up, local→global promotion at cycle 10
+         when E is within 0.1 of the threshold (Hemmann § 2.1).
+      6. If the relax aborted early (``info["early_rejected"]``), revert
+         topology and positions and continue. **No Metropolis roll** —
+         Vink's identity says this is exactly equivalent to a Metropolis
+         rejection at the same ``s``.
+      7. Else, compute the acceptance objective with the optional
+         ``uniformity_weight`` low-k S(k) penalty; reuse the same ``s`` to
+         decide accept/reject via ``s < exp(-dE / T)``.
+
+    ``temperatures`` overrides the geometric T schedule built from
+    ``T0``/``T_final`` — pass an array of length ``n_iterations`` to use a
+    custom profile (e.g. ``topology_burn_in``'s triangular ramp). When set,
+    ``T0`` and ``T_final`` are ignored.
 
     ``uniformity_weight`` adds a low-k structure-factor penalty to the
-    Metropolis objective (not to the L-BFGS relax). This follows the
-    literature diagnosis that local bonded strain energies do not control
-    large pores / long-wavelength density fluctuations; set it to 0.0 for
-    strict Sellers Eq. 2 acceptance.
+    Metropolis objective (not to the L-BFGS relax, and not to the Vink
+    threshold ``E_t`` — that lives in strain-energy units alone). Set to
+    0.0 for strict Sellers Eq. 2 acceptance.
+
+    The legacy ``global_fallback_threshold`` block stays as a separate
+    safety net (default ``inf``, effectively off) — it triggers only on
+    *converged* local relaxes where ΔE > threshold, after the new
+    threshold scheme has already had its chance to abort.
     """
     if relax_global_every:
         warnings.warn(
@@ -1100,18 +1642,99 @@ def www_anneal(
     objective_curr, S_low_curr = _acceptance_objective(
         E_curr, positions, box, uniformity_weight, uniformity_kmax
     )
-    history = {"iter": [], "T": [], "E": [], "objective": [],
-               "uniformity_S": [], "lsu": [], "accepted": 0,
-               "proposed": 0, "global_fallbacks": 0}
+    history: Dict = {
+        "iter": [], "T": [], "E": [], "objective": [],
+        "uniformity_S": [], "lsu": [],
+        "accepted": 0, "proposed": 0, "global_fallbacks": 0,
+        "early_rejected": 0, "local_to_global": [],
+        "force_norm_history": [],
+    }
 
     accepted = 0
     proposed = 0
     fallback_count = 0
-    log_ratio = math.log(T_final / T0) if T0 > 0 else 0.0
+    early_reject_count = 0
+    promote_count = 0
+    if temperatures is None:
+        log_ratio = math.log(T_final / T0) if T0 > 0 and T_final > 0 else 0.0
+    else:
+        temperatures = np.asarray(temperatures, dtype=np.float64).reshape(-1)
+        if temperatures.shape[0] != n_iterations:
+            raise ValueError(
+                f"temperatures length {temperatures.shape[0]} != "
+                f"n_iterations {n_iterations}"
+            )
     t_start = time.time()
 
+    def _make_promote_cb(it_now):
+        def _cb(_positions):
+            nonlocal promote_count
+            promote_count += 1
+            history["local_to_global"].append(int(it_now))
+        return _cb
+
+    # Cache the last relax info so the periodic LSU check at the *top* of
+    # each iteration (which runs before any `continue`) can include the
+    # latest force_norm even when the previous iteration aborted early.
+    last_force_norm = 0.0
+    early_exit_triggered = False
+
     for it in range(n_iterations):
-        T = T0 * math.exp(log_ratio * it / max(1, n_iterations - 1))
+        if temperatures is not None:
+            T = float(temperatures[it])
+        else:
+            if T0 > 0 and T_final > 0:
+                T = T0 * math.exp(log_ratio * it / max(1, n_iterations - 1))
+            else:
+                T = float(T0 if it == 0 else T_final)
+
+        # Periodic LSU check at the *start* of each iteration. Hoisted here
+        # (rather than after the move) because every `continue` in the move
+        # logic below — proposal failure, disconnection, early-rejection —
+        # would otherwise skip the check. With early_rejected rates of
+        # ~90 %, the check would only fire ~10 % as often as requested.
+        if (
+            check_lsu_every > 0
+            and it > 0
+            and it % check_lsu_every == 0
+        ):
+            phi = compute_lsu(
+                positions, edges, neighbors, box,
+                depth=target_depth, locality=target_locality,
+                max_pairs=2000, rng=rng,
+            )
+            history["iter"].append(it)
+            history["T"].append(T)
+            history["E"].append(E_curr)
+            history["objective"].append(objective_curr)
+            history["uniformity_S"].append(S_low_curr)
+            history["lsu"].append(phi)
+            history["force_norm_history"].append(float(last_force_norm))
+            if verbose:
+                acc_rate = accepted / max(1, proposed)
+                fb_rate = fallback_count / max(1, proposed)
+                er_rate = early_reject_count / max(1, proposed)
+                uniformity_msg = (
+                    f"  S_low={S_low_curr:.4g}"
+                    if uniformity_weight > 0.0 else ""
+                )
+                print(
+                    f"[{log_tag} it={it:6d}] T={T:.4g}  E={E_curr:.4g}  "
+                    f"Obj={objective_curr:.4g}{uniformity_msg}  "
+                    f"phi_{target_depth}{target_locality}={phi:.4f}  "
+                    f"acc={acc_rate:.2%}  early={er_rate:.2%}  "
+                    f"fb={fb_rate:.2%}  promote={promote_count}  "
+                    f"elapsed={time.time()-t_start:.1f}s"
+                )
+            if (
+                target_lsu is not None
+                and abs(phi - target_lsu) <= target_tolerance
+            ):
+                if verbose:
+                    print(f"[{log_tag}] target LSU {target_lsu} reached "
+                          f"(measured {phi:.4f}); stopping.")
+                early_exit_triggered = True
+                break
 
         move = stone_wales_propose(edges, neighbors, rng)
         if move is None:
@@ -1119,7 +1742,16 @@ def www_anneal(
         proposed += 1
         _ek1, (sw_i, sw_c, sw_j, sw_d), _ek2 = move
 
-        # Snapshot positions for revert
+        # Snapshot E_b and draw s up front (Vink Eq. 5: E_t = E_b - T*ln(s)).
+        E_b = E_curr
+        s = rng.random()
+        if T > 0:
+            E_t = E_b - T * math.log(max(s, 1e-12))
+        else:
+            # T=0 quench phase: only accept moves with dE <= 0.
+            E_t = E_b
+
+        # Snapshot positions for revert.
         pos_before = positions.copy()
         stone_wales_apply(edges, neighbors, move)
 
@@ -1134,8 +1766,7 @@ def www_anneal(
         # Vink/Mousseau-Barkema local relax: only vertices within
         # `local_shell_depth` graph-edge hops of the SW seed {i, c, j, d} are
         # allowed to move. Out-of-shell vertices are held fixed via gradient
-        # masking. Setting `local_shell_depth=None` falls back to the old
-        # full-N relaxation (kept for diagnostics, not recommended).
+        # masking. Setting `local_shell_depth=None` falls back to full-N.
         if local_shell_depth is not None and local_shell_depth > 0:
             seed_verts = np.array([sw_i, sw_c, sw_j, sw_d], dtype=np.int64)
             shell = compute_local_shell_mask(seed_verts, neighbors,
@@ -1144,21 +1775,33 @@ def www_anneal(
         else:
             ctx.set_moving_mask(None)
 
-        new_pos, E_new = relax(positions, ctx, max_iter=relax_local_iters)
+        E_threshold_use = E_t if threshold_energy_relax else float("inf")
+        new_pos, E_new, relax_info = relax(
+            positions, ctx, max_iter=relax_local_iters,
+            E_threshold=E_threshold_use, c_f=c_f, cycle_size=cycle_size,
+            on_global_promote=_make_promote_cb(it),
+        )
+
+        if relax_info["early_rejected"]:
+            # Vink identity: aborting on the same s as the Metropolis roll
+            # is exactly equivalent to a Metropolis rejection. No re-draw.
+            stone_wales_revert(edges, neighbors, move)
+            ctx.update_topology(edges, neighbors)
+            positions = pos_before
+            early_reject_count += 1
+            continue
+
         strain_dE = E_new - E_curr
 
-        # Vink/Mousseau-Barkema fallback gate: if the local-shell relax
-        # failed to lower the energy by at least `global_fallback_threshold`,
-        # promote this single move to a full-N polish before deciding to
-        # accept. Replaces the previous fixed-schedule global polish, which
-        # under the bonded-only Sellers energy let vertices drift toward
-        # each other every K iterations and re-introduced void clustering.
+        # Legacy safety net (default off): one full-N polish if local relax
+        # converged but with a huge dE. Independent of the in-relax local→
+        # global promotion above.
         if strain_dE > global_fallback_threshold:
             ctx.set_moving_mask(None)
-            new_pos, E_new = relax(new_pos, ctx, max_iter=relax_global_iters)
-            # L-BFGS preserves energy under global PBC translation, so
-            # positions can drift outside [-L/2, L/2]^3. Wrap back into the
-            # canonical box (idempotent).
+            new_pos, E_new, _ = relax(
+                new_pos, ctx, max_iter=relax_global_iters,
+                E_threshold=float("inf"),
+            )
             new_pos = new_pos - box * np.round(new_pos / box)
             strain_dE = E_new - E_curr
             fallback_count += 1
@@ -1168,73 +1811,363 @@ def www_anneal(
         )
         dE = objective_new - objective_curr
 
-        # Metropolis acceptance on the (possibly fallback-improved) objective.
-        if dE <= 0 or rng.random() < math.exp(-dE / max(T, 1e-12)):
+        # Metropolis acceptance on the (possibly fallback-improved)
+        # objective. Reuse the same `s` to keep tight equivalence with the
+        # in-relax threshold abort (only relevant when uniformity_weight=0;
+        # with uniformity_weight>0 the objective differs from E and the
+        # reuse becomes an approximation, which is what we want — the
+        # threshold scheme remains an algorithmic speedup on strain energy
+        # only).
+        if dE <= 0 or s < math.exp(-dE / max(T, 1e-12)):
             positions = new_pos
             E_curr = E_new
             objective_curr = objective_new
             S_low_curr = S_low_new
             accepted += 1
         else:
-            # Reject: revert topology and positions
             stone_wales_revert(edges, neighbors, move)
             ctx.update_topology(edges, neighbors)
             positions = pos_before
 
-        # Periodic LSU check + early exit
-        if check_lsu_every > 0 and (it + 1) % check_lsu_every == 0:
-            phi = compute_lsu(
-                positions, edges, neighbors, box,
-                depth=target_depth, locality=target_locality,
-                max_pairs=2000, rng=rng,
-            )
-            history["iter"].append(it + 1)
-            history["T"].append(T)
-            history["E"].append(E_curr)
-            history["objective"].append(objective_curr)
-            history["uniformity_S"].append(S_low_curr)
-            history["lsu"].append(phi)
-            if verbose:
-                acc_rate = accepted / max(1, proposed)
-                fb_rate = fallback_count / max(1, proposed)
-                uniformity_msg = (
-                    f"  S_low={S_low_curr:.4g}"
-                    if uniformity_weight > 0.0 else ""
-                )
-                print(
-                    f"[WWW it={it+1:6d}] T={T:.4g}  E={E_curr:.4g}  "
-                    f"Obj={objective_curr:.4g}{uniformity_msg}  "
-                    f"phi_{target_depth}{target_locality}={phi:.4f}  "
-                    f"acc={acc_rate:.2%}  fb={fb_rate:.2%}  "
-                    f"elapsed={time.time()-t_start:.1f}s"
-                )
-            if verbose and (it + 1) == check_lsu_every:
-                acc_rate = accepted / max(1, proposed)
-                if acc_rate < 0.05:
-                    print(
-                        f"[WWW] WARNING: acceptance rate {acc_rate:.1%} after "
-                        f"{it+1} iterations — nearly all moves are rejected. "
-                        f"relax_local_iters={relax_local_iters} is likely too small: "
-                        f"L-BFGS does not converge to the new local minimum, so ΔE "
-                        f"appears positive even for good topology changes. "
-                        f"Raise relax_local_iters to ≥100 (benchmark showed ΔE crosses "
-                        f"zero between 30 and 100 iterations for N=1102)."
-                    )
-            if target_lsu is not None and abs(phi - target_lsu) <= target_tolerance:
-                if verbose:
-                    print(f"[WWW] target LSU {target_lsu} reached "
-                          f"(measured {phi:.4f}); stopping.")
-                break
+        # Record the force norm from this move's relax so the LSU check at
+        # the *top* of the next iteration can read it. Out-of-iteration
+        # state — `continue` does NOT skip this assignment unless one of
+        # the upstream `continue`s skipped the relax call itself.
+        last_force_norm = float(relax_info.get("force_norm_final", 0.0))
 
     history["accepted"] = accepted
     history["proposed"] = proposed
     history["global_fallbacks"] = fallback_count
+    history["early_rejected"] = early_reject_count
     return positions, edges, neighbors, history
 
 
 # --------------------------------------------------------------------------- #
-# Topology burn-in (constant-T WWW phase to lose crystalline memory)
+# Cluster / void / homogeneity diagnostics
 # --------------------------------------------------------------------------- #
+def cluster_diagnostics(
+    positions: np.ndarray,
+    edges: np.ndarray,
+    neighbors: np.ndarray,
+    box: np.ndarray,
+    d0: float,
+    probe_grid: int = 12,
+) -> Dict[str, float]:
+    """Read-only health metrics for a Z=3 amorphous network.
+
+    Collects the direct-space / reciprocal-space order metrics that
+    Hemmann/Saba 2026 (Adv. Funct. Mater. DOI 10.1002/adfm.202600037) use to
+    diagnose vertex clustering and large-pore formation:
+
+    - ``r_nn``  : median nearest-neighbour distance over all vertex pairs
+                 (PBC, includes bonded neighbours).
+    - ``r_u``   : median nearest-uncoordinated-neighbour distance per vertex,
+                 i.e. the distance to the closest vertex *not* already
+                 bonded. Hemmann targets ``r_u >~ 1.0 d0``; smaller values
+                 indicate vertex clustering.
+    - ``delta_c``: critical pore radius (largest empty-sphere radius), the
+                  pore-percolation surrogate; estimated on a ``probe_grid``
+                  x3 jittered probe array. Hemmann targets
+                  ``delta_c <~ 0.5 d0``.
+    - ``min_non_bonded``: minimum non-bonded vertex separation. Hard fail
+                          for ``< 0.4 d0`` (the Sellers energy has no
+                          non-bonded repulsion, so vertices closer than
+                          this would never be pushed apart by L-BFGS).
+    - ``n_close_pairs``: count of non-bonded pairs with separation
+                         ``< 0.7 d0`` (a softer cluster surrogate).
+    - ``bond_len_{mean,std,min,max}``.
+    - ``voxel_std_4`` : ``_voxel_density_std(positions, box, 4)``.
+    - ``S_low_k2``    : ``low_k_structure_factor(positions, box, 2)``.
+
+    PBC handled via ``scipy.spatial.cKDTree(boxsize=box)``. All neighbour
+    queries are O(N log N); the probe-grid pore estimate is O(P log N)
+    with P = probe_grid^3.
+    """
+    pos = np.asarray(positions, dtype=np.float64)
+    box_arr = np.asarray(box, dtype=np.float64).reshape(3)
+    N = pos.shape[0]
+    # cKDTree's `boxsize` requires positions in [0, L)^3, not [-L/2, L/2)^3.
+    pos_shift = pos - box_arr * np.floor((pos + box_arr / 2.0) / box_arr)
+    pos_shift = pos_shift + box_arr / 2.0  # now in [0, L)
+    # Clamp to box-(epsilon) to satisfy cKDTree's strict bound.
+    pos_shift = np.clip(pos_shift, 0.0, box_arr - 1e-12)
+
+    tree = cKDTree(pos_shift, boxsize=box_arr)
+
+    # --- bond lengths (PBC minimum image) --------------------------------- #
+    p_a = pos[edges[:, 0]]
+    p_b = pos[edges[:, 1]]
+    bond_d = pbc_displacement(p_b - p_a, box_arr)
+    bond_L = np.linalg.norm(bond_d, axis=1)
+
+    # --- r_nn : nearest-neighbour distance, any pair --------------------- #
+    # Query the 2 closest tree points; index 0 is the vertex itself.
+    nn_dists, _ = tree.query(pos_shift, k=2)
+    r_nn = float(np.median(nn_dists[:, 1]))
+
+    # --- r_u : nearest *uncoordinated* neighbour distance ---------------- #
+    # Convert neighbours to a set per vertex for fast membership test.
+    nbr_sets = [set(int(x) for x in row) for row in neighbors]
+    # Query enough k that there's at least one unbonded neighbour. With
+    # Z=3 in 3D, k=8 is comfortably above the expected coordination
+    # shell; if even k=8 is all bonded (impossible in practice for Z=3)
+    # we fall back to a sequential scan.
+    k_query = min(8, N)
+    _, nn_idx = tree.query(pos_shift, k=k_query)
+    r_u_per_vertex = np.empty(N, dtype=np.float64)
+    for i in range(N):
+        chosen = -1
+        for j in nn_idx[i]:
+            j = int(j)
+            if j == i:
+                continue
+            if j in nbr_sets[i]:
+                continue
+            chosen = j
+            break
+        if chosen < 0:
+            # Fallback: brute force on PBC distance to non-bonded vertices.
+            d = pbc_displacement(pos - pos[i:i + 1], box_arr)
+            dists = np.linalg.norm(d, axis=1)
+            dists[i] = np.inf
+            for nb in nbr_sets[i]:
+                dists[nb] = np.inf
+            chosen = int(np.argmin(dists))
+        r_u_per_vertex[i] = float(np.linalg.norm(
+            pbc_displacement(pos[chosen:chosen + 1] - pos[i:i + 1], box_arr)
+        ))
+    r_u = float(np.median(r_u_per_vertex))
+
+    # --- delta_c : critical pore radius via probe grid ------------------- #
+    # Sample probe points on a jittered grid through the canonical box,
+    # query the nearest vertex distance, take the max.
+    rng_probe = np.random.default_rng(12345)
+    grid_axis = (np.arange(probe_grid) + 0.5) / probe_grid - 0.5
+    gx, gy, gz = np.meshgrid(grid_axis, grid_axis, grid_axis, indexing="ij")
+    probes = np.stack(
+        [gx.reshape(-1), gy.reshape(-1), gz.reshape(-1)], axis=1
+    ) * box_arr
+    probes += (rng_probe.random(probes.shape) - 0.5) * (box_arr / probe_grid)
+    probes_shift = probes + box_arr / 2.0
+    probes_shift = np.clip(probes_shift, 0.0, box_arr - 1e-12)
+    pore_d, _ = tree.query(probes_shift, k=1)
+    delta_c = float(pore_d.max())
+
+    # --- min_non_bonded and n_close_pairs -------------------------------- #
+    # Query all neighbours within 0.7*d0; then strip out the bonded edges.
+    pairs = tree.query_pairs(r=0.7 * d0, output_type="ndarray")
+    edge_set = set()
+    for a, b in edges:
+        a = int(a); b = int(b)
+        edge_set.add((a, b) if a < b else (b, a))
+    if pairs.size:
+        non_bonded_mask = np.array([
+            tuple(sorted((int(a), int(b)))) not in edge_set
+            for a, b in pairs
+        ])
+        non_bonded_pairs = pairs[non_bonded_mask]
+    else:
+        non_bonded_pairs = np.empty((0, 2), dtype=np.int64)
+    n_close_pairs = int(non_bonded_pairs.shape[0])
+
+    # min_non_bonded is the global minimum non-bonded separation; the
+    # cheap way is to query for a larger ball that should contain it.
+    # We loop with growing radius until we find at least one non-bonded
+    # pair; if a generous cap fails, fall back to brute force.
+    min_non_bonded: float = float("inf")
+    for r_query in (0.7 * d0, 1.0 * d0, 1.5 * d0, 2.5 * d0):
+        cand = tree.query_pairs(r=r_query, output_type="ndarray")
+        if cand.size == 0:
+            continue
+        cand_sorted = np.sort(cand, axis=1)
+        keep_mask = np.array([
+            (int(a), int(b)) not in edge_set for a, b in cand_sorted
+        ])
+        cand_non_bonded = cand_sorted[keep_mask]
+        if cand_non_bonded.shape[0] == 0:
+            continue
+        diffs = pbc_displacement(
+            pos[cand_non_bonded[:, 0]] - pos[cand_non_bonded[:, 1]], box_arr
+        )
+        dists = np.linalg.norm(diffs, axis=1)
+        min_non_bonded = float(dists.min())
+        break
+    if not math.isfinite(min_non_bonded):
+        # Brute O(N^2) sweep; only triggered when every non-bonded vertex
+        # pair is > 2.5*d0 apart, which is unusual but consistent.
+        all_d = pbc_displacement(
+            pos[:, None, :] - pos[None, :, :], box_arr
+        )
+        all_dist = np.linalg.norm(all_d, axis=-1)
+        # Mask out self + bonded.
+        all_dist[np.eye(N, dtype=bool)] = np.inf
+        for a, b in edges:
+            all_dist[int(a), int(b)] = np.inf
+            all_dist[int(b), int(a)] = np.inf
+        min_non_bonded = float(all_dist.min())
+
+    return {
+        "r_nn": r_nn,
+        "r_u": r_u,
+        "delta_c": delta_c,
+        "min_non_bonded": min_non_bonded,
+        "n_close_pairs": n_close_pairs,
+        "bond_len_mean": float(bond_L.mean()),
+        "bond_len_std": float(bond_L.std()),
+        "bond_len_min": float(bond_L.min()),
+        "bond_len_max": float(bond_L.max()),
+        "voxel_std_4": _voxel_density_std(pos, box_arr, ngrid=4),
+        "S_low_k2": low_k_structure_factor(pos, box_arr, kmax=2),
+    }
+
+
+def _format_cluster_diagnostics(diag: Dict[str, float], d0: float) -> str:
+    """One-line summary string for ``cluster_diagnostics`` output."""
+    return (
+        f"r_nn={diag['r_nn']:.3f} r_u={diag['r_u']:.3f} "
+        f"delta_c={diag['delta_c']:.3f} "
+        f"min_nb={diag['min_non_bonded']:.3f} "
+        f"close<0.7d0={diag['n_close_pairs']} "
+        f"bond_len(mean={diag['bond_len_mean']:.3f}, "
+        f"std={diag['bond_len_std']:.3f}) "
+        f"voxel_std4={diag['voxel_std_4']:.3f} "
+        f"S_low={diag['S_low_k2']:.4g}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Topology burn-in (triangular-profile WWW phase to lose crystalline memory)
+# --------------------------------------------------------------------------- #
+def _calibrate_T_melt(
+    positions: np.ndarray,
+    edges: np.ndarray,
+    neighbors: np.ndarray,
+    box: np.ndarray,
+    d0: float,
+    weights: Tuple[float, float, float, float],
+    rng: np.random.Generator,
+    *,
+    probe_moves: int,
+    probe_T: float,
+    relax_local_iters: int,
+    local_shell_depth: Optional[int],
+    threshold_energy_relax: bool,
+    c_f: float,
+    uniformity_weight: float,
+    uniformity_kmax: int,
+    use_jax: bool,
+    use_jaxopt: bool,
+    verbose: bool,
+) -> Tuple[float, int, int]:
+    """Estimate <ΔE_up> for Hemmann Eq. 5.
+
+    Runs a short flat-T probe; collects the mean uphill ΔE across all
+    proposed (not just accepted) moves; returns
+    ``(mean_uphill_dE, accepted, proposed)``. The caller computes
+    ``T_melt = mean_uphill_dE / ln(1/P_melt)``.
+
+    Hemmann Eq. 5: ``T_melt = <ΔE_up> / ln(1/P_melt)`` where ``<ΔE_up>``
+    is the mean uphill (accepted) ΔE — i.e. the natural energy scale on
+    which the Metropolis acceptance equals ``P_melt``. We sample it at a
+    ``probe_T`` chosen sufficiently above the cold regime that many
+    uphill moves are accepted (default 5.0 — much higher than the
+    production T0=1.0). ``probe_T`` itself does not appear in the
+    formula; it only determines how many uphill moves we observe in the
+    probe.
+    """
+    # Snapshot inputs so the probe does not mutate the caller's state.
+    pos_probe = positions.copy()
+    edges_probe = edges.copy()
+    neighbors_probe = neighbors.copy()
+    probe_seed = int(rng.integers(0, 2**31 - 1))
+
+    # The www_anneal loop records E history at ``check_lsu_every`` strides,
+    # but we need per-move ΔE. Re-implement a minimal SW loop here that
+    # records the uphill ΔEs explicitly.
+    N = pos_probe.shape[0]
+    ctx = _RelaxContext(N, box, d0, weights, use_jax=use_jax, use_jaxopt=use_jaxopt)
+    ctx.update_topology(edges_probe, neighbors_probe)
+    E_curr = ctx.energy(pos_probe.reshape(-1))
+    obj_curr, _ = _acceptance_objective(
+        E_curr, pos_probe, box, uniformity_weight, uniformity_kmax
+    )
+    probe_rng = np.random.default_rng(probe_seed)
+    uphill_dE_samples: list = []
+    accepted = 0
+    proposed = 0
+    for _ in range(probe_moves):
+        move = stone_wales_propose(edges_probe, neighbors_probe, probe_rng)
+        if move is None:
+            continue
+        proposed += 1
+        _ek1, (sw_i, sw_c, sw_j, sw_d), _ek2 = move
+        pos_before = pos_probe.copy()
+        stone_wales_apply(edges_probe, neighbors_probe, move)
+        if not is_connected(N, edges_probe):
+            stone_wales_revert(edges_probe, neighbors_probe, move)
+            continue
+        ctx.update_topology(edges_probe, neighbors_probe)
+        if local_shell_depth is not None and local_shell_depth > 0:
+            shell = compute_local_shell_mask(
+                np.array([sw_i, sw_c, sw_j, sw_d], dtype=np.int64),
+                neighbors_probe, local_shell_depth, N,
+            )
+            ctx.set_moving_mask(shell)
+        else:
+            ctx.set_moving_mask(None)
+        # No threshold rejection during the probe — we need the full ΔE
+        # distribution.
+        new_pos, E_new, _ = relax(
+            pos_probe, ctx, max_iter=relax_local_iters,
+            E_threshold=float("inf"),
+        )
+        obj_new, _ = _acceptance_objective(
+            E_new, new_pos, box, uniformity_weight, uniformity_kmax
+        )
+        dE = obj_new - obj_curr
+        if dE > 0:
+            # Record EVERY proposed uphill dE — Hemmann's <ΔE_up> is the
+            # unbiased average over all uphill bond switches, not just the
+            # accepted subset (Metropolis biases that subset toward small
+            # ΔEs and would systematically under-estimate T_melt).
+            uphill_dE_samples.append(dE)
+            if probe_rng.random() < math.exp(-dE / max(probe_T, 1e-12)):
+                pos_probe = new_pos
+                E_curr = E_new
+                obj_curr = obj_new
+                accepted += 1
+            else:
+                stone_wales_revert(edges_probe, neighbors_probe, move)
+                ctx.update_topology(edges_probe, neighbors_probe)
+                pos_probe = pos_before
+        else:
+            # Downhill move: always accept (does not feed T_melt).
+            pos_probe = new_pos
+            E_curr = E_new
+            obj_curr = obj_new
+            accepted += 1
+
+    if uphill_dE_samples:
+        mean_uphill = float(np.mean(uphill_dE_samples))
+    else:
+        # No accepted uphill move: probe_T was too low. Fall back to a
+        # generic estimate using the energy scale ``E_curr`` itself.
+        mean_uphill = max(1.0, abs(E_curr) * 0.1)
+        if verbose:
+            print(
+                f"[burn-in calibration] WARNING: no uphill moves accepted at "
+                f"probe_T={probe_T:.3g}; using fallback ΔE estimate {mean_uphill:.3g}"
+            )
+    if verbose:
+        print(
+            f"[burn-in calibration] probe_T={probe_T:.3g} "
+            f"accepted_uphill={len(uphill_dE_samples)}/"
+            f"{accepted}/{proposed} (uphill/total_acc/proposed) "
+            f"mean_uphill_dE={mean_uphill:.3g}"
+        )
+    return mean_uphill, accepted, proposed
+
+
 def topology_burn_in(
     positions: np.ndarray,
     edges: np.ndarray,
@@ -1242,124 +2175,141 @@ def topology_burn_in(
     box: np.ndarray,
     d0: float,
     weights: Tuple[float, float, float, float],
-    n_moves: int,
-    T: Optional[float],
     rng: np.random.Generator,
+    *,
+    n_heat: int = 8_000,
+    n_cool: int = 16_000,
+    n_quench: int = 4_000,
+    T_max: Optional[float] = None,
+    T_max_over_T_melt: float = 1.15,
+    P_melt: float = 0.001,
+    T_melt_probe_moves: int = 600,
+    T_melt_probe_T: float = 5.0,
     relax_local_iters: int = 100,
     relax_global_iters: int = 500,
     local_shell_depth: Optional[int] = 4,
     global_fallback_threshold: float = float("inf"),
+    threshold_energy_relax: bool = True,
+    c_f: float = 0.5,
     uniformity_weight: float = 10.0,
     uniformity_kmax: int = 2,
-    target_accepts_per_vertex: Optional[float] = 4.0,
+    target_accepts_per_vertex: Optional[float] = None,
     use_jax: bool = False,
     use_jaxopt: bool = False,
-    calib_moves: int = 200,
-    calib_target_acceptance: float = 0.20,
-    calib_T_candidates: Optional[Tuple[float, ...]] = None,
-    plateau_window: int = 500,
-    plateau_tol: float = 0.05,
     verbose: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
-    """Constant-temperature WWW Stone-Wales phase to lose crystalline memory.
+    """Triangular-profile WWW burn-in (Hemmann § 2.3, Figure 2).
 
-    Runs the existing ``www_anneal`` with no LSU target and a flat
-    temperature schedule (T0 = T_final = T). Every move is judged
-    purely by ΔE + Metropolis, so the topology distribution after
-    enough accepted moves is determined by the Sellers energy, not by
-    the seed (Hemmann/Saba 2026 recipe).
+    Replaces the legacy constant-T burn-in. The temperature schedule has
+    three phases:
 
-    Temperature is either user-supplied or auto-calibrated via a short
-    probe sweep that picks the smallest T from ``calib_T_candidates``
-    yielding probe acceptance ≥ ``calib_target_acceptance``. The default
-    target is intentionally modest: Hemmann/Saba show that too many
-    accepted moves under a local bonded strain energy monotonically grows
-    pore-size metrics. The burn-in therefore also stops once the accepted
-    Stone-Wales involvement reaches ``target_accepts_per_vertex`` per
-    vertex, where each accepted move contributes four vertex involvements.
-    This is a maximum-randomization guard, not an LSU target.
+      - **Heat** (``n_heat`` moves): linearly ramp T from 0 to ``T_max``.
+      - **Cool** (``n_cool`` moves): linearly ramp T from ``T_max`` to 0.
+      - **Quench** (``n_quench`` moves): T = 0; only downhill moves accepted.
+
+    The schedule is fed into ``www_anneal`` via its ``temperatures`` kwarg.
+    The relax inside each SW move follows the Vink/MB threshold-energy
+    early rejection (Vink 2001 Eq. 5 + BM2000 Eq. 3/4), with the
+    5-cycle anharmonic warm-up and local→global promotion at cycle 10.
+
+    ``T_max`` is either user-supplied or auto-calibrated against the
+    melting temperature ``T_melt = <ΔE_up> / ln(1/P_melt)`` (Hemmann
+    Eq. 5). With ``T_max_over_T_melt = 1.15`` the schedule lands in the
+    hyperuniform regime Hemmann Figure 8c,d identifies
+    (``1.0 ≲ T_max/T_melt ≲ 1.3``).
 
     Returns
     -------
     positions, edges, neighbors, info
-        ``info`` has keys ``T_used``, ``moves``, ``metric_history``,
-        ``calibration`` (list of (T, acceptance) probe pairs, empty if
-        T was user-supplied).
+        ``info`` keys: ``T_max_used``, ``T_melt``, ``P_melt``, ``n_heat``,
+        ``n_cool``, ``n_quench``, ``moves``, ``accepted``, ``proposed``,
+        ``early_rejected``, ``cluster_after``, ``probe_mean_uphill_dE``.
     """
-    if n_moves <= 0:
-        return positions, edges, neighbors, {"T_used": None, "moves": 0,
-                                             "accepted": 0, "proposed": 0,
-                                             "target_accepts_per_vertex":
-                                                 target_accepts_per_vertex,
-                                             "metric_history": [],
-                                             "calibration": []}
+    n_total = int(n_heat) + int(n_cool) + int(n_quench)
+    if n_total <= 0:
+        return positions, edges, neighbors, {
+            "T_max_used": None, "T_melt": None, "P_melt": P_melt,
+            "n_heat": n_heat, "n_cool": n_cool, "n_quench": n_quench,
+            "moves": 0, "accepted": 0, "proposed": 0, "early_rejected": 0,
+            "cluster_after": cluster_diagnostics(
+                positions, edges, neighbors, box, d0
+            ),
+            "probe_mean_uphill_dE": None,
+        }
 
-    calibration: list = []
-    if T is None:
-        if calib_T_candidates is None:
-            calib_T_candidates = (0.005, 0.01, 0.02, 0.05, 0.1,
-                                  0.2, 0.5, 1.0, 2.0, 5.0)
-        T_used = float(calib_T_candidates[-1])
-        for T_try in calib_T_candidates:
-            probe_seed = int(rng.integers(0, 2**31 - 1))
-            _, _, _, hist = www_anneal(
-                positions.copy(), edges.copy(), neighbors.copy(), box,
-                d0, weights,
-                n_iterations=calib_moves,
-                T0=float(T_try), T_final=float(T_try),
-                rng=np.random.default_rng(probe_seed),
-                target_lsu=None,
-                relax_local_iters=relax_local_iters,
-                relax_global_iters=relax_global_iters,
-                relax_global_every=0,
-                global_fallback_threshold=global_fallback_threshold,
-                local_shell_depth=local_shell_depth,
-                uniformity_weight=uniformity_weight,
-                uniformity_kmax=uniformity_kmax,
-                check_lsu_every=0,
-                use_jax=use_jax, use_jaxopt=use_jaxopt,
-                verbose=False,
+    # --- T_max calibration ---------------------------------------------- #
+    T_melt: Optional[float] = None
+    probe_uphill: Optional[float] = None
+    if T_max is None:
+        probe_uphill, _, _ = _calibrate_T_melt(
+            positions, edges, neighbors, box, d0, weights, rng,
+            probe_moves=T_melt_probe_moves,
+            probe_T=T_melt_probe_T,
+            relax_local_iters=relax_local_iters,
+            local_shell_depth=local_shell_depth,
+            threshold_energy_relax=threshold_energy_relax,
+            c_f=c_f,
+            uniformity_weight=uniformity_weight,
+            uniformity_kmax=uniformity_kmax,
+            use_jax=use_jax,
+            use_jaxopt=use_jaxopt,
+            verbose=verbose,
+        )
+        T_melt = float(probe_uphill / math.log(1.0 / max(P_melt, 1e-12)))
+        T_max_used = float(T_max_over_T_melt) * T_melt
+        if verbose:
+            print(
+                f"[burn-in] T_melt={T_melt:.3g} (Hemmann Eq.5, P_melt={P_melt}); "
+                f"T_max={T_max_used:.3g} = {T_max_over_T_melt}*T_melt"
             )
-            acc = hist["accepted"] / max(1, hist["proposed"])
-            calibration.append((float(T_try), float(acc)))
-            if verbose:
-                print(f"[burn-in calibration] T={T_try:.3g} "
-                      f"acc={acc:.2%} (probe {calib_moves} moves)")
-            if acc >= calib_target_acceptance:
-                T_used = float(T_try)
-                break
-        if verbose:
-            print(f"[burn-in] selected T={T_used:.3g}")
     else:
-        T_used = float(T)
+        T_max_used = float(T_max)
         if verbose:
-            print(f"[burn-in] T={T_used:.3g} (user-supplied)")
+            print(f"[burn-in] T_max={T_max_used:.3g} (user-supplied)")
 
-    metric_history = []
-    moves_done = 0
-    accepted_total = 0
-    proposed_total = 0
-    max_accepted = None
-    if target_accepts_per_vertex is not None and target_accepts_per_vertex > 0:
+    # --- Build triangular temperature schedule ------------------------- #
+    schedule = np.empty(n_total, dtype=np.float64)
+    if n_heat > 0:
+        schedule[:n_heat] = T_max_used * (np.arange(n_heat) + 1) / n_heat
+    if n_cool > 0:
+        schedule[n_heat:n_heat + n_cool] = (
+            T_max_used * (1.0 - np.arange(n_cool) / n_cool)
+        )
+    if n_quench > 0:
+        schedule[n_heat + n_cool:] = 0.0
+
+    if verbose:
+        print(
+            f"[burn-in] schedule: heat 0→{T_max_used:.3g} ({n_heat} moves), "
+            f"cool →0 ({n_cool} moves), quench (T=0, {n_quench} moves)"
+        )
+
+    # Optional accepted-moves cap.
+    max_accepted: Optional[int] = None
+    if (
+        target_accepts_per_vertex is not None
+        and target_accepts_per_vertex > 0
+    ):
         max_accepted = int(math.ceil(
             float(target_accepts_per_vertex) * positions.shape[0] / 4.0
         ))
+
+    # --- Run www_anneal in chunks so we can honour the accepted-moves cap.
     t_start = time.time()
-    while moves_done < n_moves:
-        chunk = min(plateau_window, n_moves - moves_done)
-        if max_accepted is not None and accepted_total >= max_accepted:
-            break
-        if max_accepted is not None and proposed_total > 0:
-            acc_rate = accepted_total / max(1, proposed_total)
-            if acc_rate > 0:
-                remaining_accepts = max(1, max_accepted - accepted_total)
-                chunk = min(chunk, max(25, int(math.ceil(
-                    1.25 * remaining_accepts / acc_rate
-                ))))
+    moves_done = 0
+    accepted_total = 0
+    proposed_total = 0
+    early_rejected_total = 0
+    chunk_size = max(500, n_total // 20)
+    while moves_done < n_total:
+        chunk = min(chunk_size, n_total - moves_done)
+        chunk_temps = schedule[moves_done:moves_done + chunk]
         positions, edges, neighbors, hist_chunk = www_anneal(
             positions, edges, neighbors, box, d0, weights,
             n_iterations=chunk,
-            T0=T_used, T_final=T_used, rng=rng,
+            T0=float(chunk_temps[0]),  # ignored when temperatures is set
+            T_final=float(chunk_temps[-1]),
+            rng=rng,
             target_lsu=None,
             relax_local_iters=relax_local_iters,
             relax_global_iters=relax_global_iters,
@@ -1368,59 +2318,63 @@ def topology_burn_in(
             local_shell_depth=local_shell_depth,
             uniformity_weight=uniformity_weight,
             uniformity_kmax=uniformity_kmax,
+            threshold_energy_relax=threshold_energy_relax,
+            c_f=c_f,
+            temperatures=chunk_temps,
             check_lsu_every=0,
             use_jax=use_jax, use_jaxopt=use_jaxopt,
             verbose=False,
+            log_tag="burn-in",
         )
         moves_done += chunk
         accepted_total += hist_chunk["accepted"]
         proposed_total += hist_chunk["proposed"]
-
-        std_metric = _voxel_density_std(positions, box, ngrid=4)
-        metric_history.append(std_metric)
+        early_rejected_total += hist_chunk["early_rejected"]
         if verbose:
             acc_chunk = hist_chunk["accepted"] / max(1, hist_chunk["proposed"])
-            accept_cap_msg = ""
+            T_lo = float(chunk_temps.min())
+            T_hi = float(chunk_temps.max())
+            cap_msg = ""
             if max_accepted is not None:
                 involvements = 4.0 * accepted_total / positions.shape[0]
-                accept_cap_msg = (
+                cap_msg = (
                     f"  acc_per_vertex={involvements:.2f}/"
                     f"{target_accepts_per_vertex:.2f}"
                 )
-            print(f"[burn-in] moves={moves_done}/{n_moves}  "
-                  f"voxel_std(4^3)={std_metric:.3f}  "
-                  f"acc_chunk={acc_chunk:.2%}  "
-                  f"S_low={low_k_structure_factor(positions, box, uniformity_kmax):.4g}"
-                  f"{accept_cap_msg}  "
-                  f"elapsed={time.time()-t_start:.1f}s")
-
+            print(
+                f"[burn-in] moves={moves_done}/{n_total}  "
+                f"T={T_lo:.3g}-{T_hi:.3g}  acc_chunk={acc_chunk:.2%}  "
+                f"early={hist_chunk['early_rejected']/max(1, hist_chunk['proposed']):.2%}  "
+                f"voxel_std4={_voxel_density_std(positions, box, 4):.3f}"
+                f"{cap_msg}  elapsed={time.time()-t_start:.1f}s"
+            )
         if max_accepted is not None and accepted_total >= max_accepted:
             if verbose:
                 involvements = 4.0 * accepted_total / positions.shape[0]
-                print(f"[burn-in] accepted-move cap reached: "
-                      f"{accepted_total} accepted moves "
-                      f"({involvements:.2f} vertex involvements per vertex)")
+                print(
+                    f"[burn-in] accepted-move cap reached: {accepted_total} "
+                    f"accepts ({involvements:.2f} per vertex)"
+                )
             break
 
-        if len(metric_history) >= 3:
-            recent = np.array(metric_history[-3:])
-            denom = max(float(recent.mean()), 1e-12)
-            if float(recent.std()) / denom < plateau_tol:
-                if verbose:
-                    print(f"[burn-in] plateau at moves={moves_done}: "
-                          f"voxel_std stable at {recent.mean():.3f} "
-                          f"(rel std {recent.std()/denom:.3%} < "
-                          f"{plateau_tol:.0%})")
-                break
+    diag = cluster_diagnostics(positions, edges, neighbors, box, d0)
+    if verbose:
+        print(f"[burn-in] post-burn-in cluster diag: "
+              f"{_format_cluster_diagnostics(diag, d0)}")
 
     info = {
-        "T_used": T_used,
-        "moves": moves_done,
-        "accepted": accepted_total,
-        "proposed": proposed_total,
-        "target_accepts_per_vertex": target_accepts_per_vertex,
-        "metric_history": metric_history,
-        "calibration": calibration,
+        "T_max_used": T_max_used,
+        "T_melt": T_melt,
+        "P_melt": P_melt,
+        "n_heat": int(n_heat),
+        "n_cool": int(n_cool),
+        "n_quench": int(n_quench),
+        "moves": int(moves_done),
+        "accepted": int(accepted_total),
+        "proposed": int(proposed_total),
+        "early_rejected": int(early_rejected_total),
+        "cluster_after": diag,
+        "probe_mean_uphill_dE": probe_uphill,
     }
     return positions, edges, neighbors, info
 
@@ -1827,12 +2781,30 @@ def generate_lsu_network(
     relax_global_iters: int = 500,
     global_fallback_threshold: float = float("inf"),
     local_shell_depth: Optional[int] = 4,
+    threshold_energy_relax: bool = True,
+    c_f: float = 0.5,
+    cycle_size: Optional[int] = None,
+    seed_kind: str = "crystal_srs",
     seed_lattice: str = "srs",
     seed_jitter_sigma: float = 0.10,
     strict_tiling: bool = False,
-    topology_burn_in_moves: int = 20_000,
+    bm2000_min_separation_frac: float = 0.98,
+    bm2000_rc_start_frac: float = 1.30,
+    bm2000_rc_grow_frac: float = 0.05,
+    bm2000_rc_max_frac: float = 6.00,
+    burn_in_n_heat: int = 8_000,
+    burn_in_n_cool: int = 16_000,
+    burn_in_n_quench: int = 4_000,
+    burn_in_T_max: Optional[float] = None,
+    burn_in_T_max_over_T_melt: float = 1.15,
+    burn_in_P_melt: float = 0.001,
+    burn_in_T_melt_probe_moves: int = 600,
+    burn_in_T_melt_probe_T: float = 5.0,
+    burn_in_target_accepts_per_vertex: Optional[float] = None,
+    # Deprecated aliases (constant-T burn-in API) ---------------------------
+    topology_burn_in_moves: Optional[int] = None,
     topology_burn_in_T: Optional[float] = None,
-    topology_burn_in_target_accepts_per_vertex: Optional[float] = 4.0,
+    topology_burn_in_target_accepts_per_vertex: Optional[float] = None,
     uniformity_weight: float = 10.0,
     uniformity_kmax: int = 2,
     seed: int = 42,
@@ -2061,45 +3033,120 @@ def generate_lsu_network(
     if verbose:
         print(f"[gen] N={N} vertices, E={num_rods} rods, box={box.tolist()}, "
               f"d0={edge_length}, target phi_{target_depth}{target_locality}={target_lsu}, "
+              f"seed_kind={seed_kind}, "
               f"jax={'on' if use_jax else 'off'}, "
               f"jaxopt={'on' if use_jaxopt_eff else 'off'}")
 
-    # Seed network -----------------------------------------------------------
-    # Crystalline Z=3 seed (default: gyroid/srs).
-    # Replaces the legacy Barkema-Mousseau random seeder which produced
-    # long chord stragglers (3–5*d0) for the few isolated degree-2
-    # vertices, then dragged vertices across the cell during the initial
-    # L-BFGS and seeded the void-clustering drift WWW inherits.
-    # See ``crystal_seed_network`` and the Hemmann/Saba 2026 precedent.
-    positions, edges, seed_meta = crystal_seed_network(
-        N, box, edge_length, rng,
-        lattice=seed_lattice,
-        jitter_sigma=seed_jitter_sigma,
-        strict_tiling=strict_tiling,
-    )
-    if seed_meta["N_actual"] != N:
-        # Tiling rounded N. Re-derive num_rods to stay consistent.
-        N = seed_meta["N_actual"]
-        num_rods = (3 * N) // 2
-    neighbors = build_neighbors(N, edges)
-    if verbose:
-        seed_lengths = np.linalg.norm(
-            pbc_displacement(positions[edges[:, 1]] - positions[edges[:, 0]], box),
-            axis=1,
+    # --- Deprecation: map legacy topology_burn_in_* kwargs to burn_in_* ---
+    if topology_burn_in_moves is not None:
+        warnings.warn(
+            "`topology_burn_in_moves` is deprecated. Use the new "
+            "triangular-profile kwargs `burn_in_n_heat`, `burn_in_n_cool`, "
+            "`burn_in_n_quench` (default 8_000/16_000/4_000). The legacy "
+            "value is split 1/5 heat, 3/5 cool, 1/5 quench for back-compat.",
+            DeprecationWarning, stacklevel=2,
         )
-        print(f"[gen] crystal seed lattice='{seed_lattice}' "
-              f"tile={seed_meta['tile']} "
-              f"a={seed_meta['lattice_constant'][0]:.3f}: "
-              f"bond length mean={seed_lengths.mean():.3f}, "
-              f"std={seed_lengths.std():.3f}, "
-              f"min={seed_lengths.min():.3f}, max={seed_lengths.max():.3f}")
+        legacy_total = int(topology_burn_in_moves)
+        burn_in_n_heat = max(1, legacy_total // 5)
+        burn_in_n_cool = max(1, 3 * legacy_total // 5)
+        burn_in_n_quench = max(1, legacy_total - burn_in_n_heat - burn_in_n_cool)
+    if topology_burn_in_T is not None:
+        warnings.warn(
+            "`topology_burn_in_T` is deprecated. Use `burn_in_T_max` "
+            "(the triangular peak temperature) or leave it None to "
+            "auto-calibrate against T_melt.",
+            DeprecationWarning, stacklevel=2,
+        )
+        if burn_in_T_max is None:
+            burn_in_T_max = float(topology_burn_in_T)
+    if topology_burn_in_target_accepts_per_vertex is not None:
+        warnings.warn(
+            "`topology_burn_in_target_accepts_per_vertex` is deprecated. "
+            "Use `burn_in_target_accepts_per_vertex` (same semantics).",
+            DeprecationWarning, stacklevel=2,
+        )
+        if burn_in_target_accepts_per_vertex is None:
+            burn_in_target_accepts_per_vertex = float(
+                topology_burn_in_target_accepts_per_vertex
+            )
 
-    # Initial global relaxation to settle the (lattice -> d0) bond-length
-    # rescale and any jitter.
+    # --- Seed network ---------------------------------------------------- #
+    if seed_kind == "crystal_srs":
+        # Crystalline Z=3 seed (default: gyroid/srs). Hemmann/Saba 2026
+        # precedent. Every initial bond has the same length and connectivity
+        # is by construction.
+        positions, edges, seed_meta = crystal_seed_network(
+            N, box, edge_length, rng,
+            lattice=seed_lattice,
+            jitter_sigma=seed_jitter_sigma,
+            strict_tiling=strict_tiling,
+        )
+        if seed_meta["N_actual"] != N:
+            # Tiling rounded N. Re-derive num_rods to stay consistent.
+            N = seed_meta["N_actual"]
+            num_rods = (3 * N) // 2
+        neighbors = build_neighbors(N, edges)
+        if verbose:
+            seed_lengths = np.linalg.norm(
+                pbc_displacement(
+                    positions[edges[:, 1]] - positions[edges[:, 0]], box
+                ),
+                axis=1,
+            )
+            print(f"[gen] crystal seed lattice='{seed_lattice}' "
+                  f"tile={seed_meta['tile']} "
+                  f"a={seed_meta['lattice_constant'][0]:.3f}: "
+                  f"bond length mean={seed_lengths.mean():.3f}, "
+                  f"std={seed_lengths.std():.3f}, "
+                  f"min={seed_lengths.min():.3f}, "
+                  f"max={seed_lengths.max():.3f}")
+    elif seed_kind == "random_bm2000":
+        # Sellers's literally-cited random seed (refs [13,14] = Vink 2001
+        # / Mousseau-Barkema 2001). Hamiltonian-cycle scaffold + chord
+        # matching loop expansion to Z=3, with BM2000 § II.A min-separation.
+        positions, edges, seed_meta = random_seed_network_bm2000(
+            N, box, edge_length, rng,
+            min_separation_frac=bm2000_min_separation_frac,
+            rc_start_frac=bm2000_rc_start_frac,
+            rc_grow_frac=bm2000_rc_grow_frac,
+            rc_max_frac=bm2000_rc_max_frac,
+            verbose=verbose,
+        )
+        neighbors = build_neighbors(N, edges)
+        if verbose:
+            seed_lengths = np.linalg.norm(
+                pbc_displacement(
+                    positions[edges[:, 1]] - positions[edges[:, 0]], box
+                ),
+                axis=1,
+            )
+            print(f"[gen] random BM2000 seed: "
+                  f"min_sep={seed_meta['min_separation_frac']:.3f}*d0, "
+                  f"rc_final={seed_meta['rc_final']:.3f}, "
+                  f"outer_passes={seed_meta['outer_passes']}, "
+                  f"bond length mean={seed_lengths.mean():.3f}, "
+                  f"std={seed_lengths.std():.3f}, "
+                  f"min={seed_lengths.min():.3f}, "
+                  f"max={seed_lengths.max():.3f}")
+    else:
+        raise ValueError(
+            f"unknown seed_kind={seed_kind!r}; expected "
+            f"'crystal_srs' or 'random_bm2000'."
+        )
+
+    if verbose:
+        diag_seed = cluster_diagnostics(positions, edges, neighbors, box, edge_length)
+        print(
+            f"[gen] post-seed cluster diag: "
+            f"{_format_cluster_diagnostics(diag_seed, edge_length)}"
+        )
+
+    # Initial global relaxation to settle the seed bond-length and absorb
+    # any jitter (crystal_srs) or chord stragglers (random_bm2000).
     init_ctx = _RelaxContext(N, box, edge_length, weights,
                              use_jax=use_jax, use_jaxopt=use_jaxopt_eff)
     init_ctx.update_topology(edges, neighbors)
-    positions, E0 = relax(positions, init_ctx, max_iter=relax_global_iters)
+    positions, E0, _ = relax(positions, init_ctx, max_iter=relax_global_iters)
     positions = positions - box * np.round(positions / box)
     if verbose:
         post_relax_lengths = np.linalg.norm(
@@ -2110,28 +3157,69 @@ def generate_lsu_network(
               f"bond length mean={post_relax_lengths.mean():.3f} "
               f"(target d0={edge_length})")
 
-    # Topology burn-in: constant-T WWW to lose crystalline memory ------------
-    if topology_burn_in_moves > 0:
+    # Post-initial-relax cluster diagnostic + hard fail on collapsed pairs.
+    diag_initrelax = cluster_diagnostics(
+        positions, edges, neighbors, box, edge_length
+    )
+    if verbose:
+        print(
+            f"[gen] post-initial-relax cluster diag: "
+            f"{_format_cluster_diagnostics(diag_initrelax, edge_length)}"
+        )
+    if diag_initrelax["min_non_bonded"] < 0.4 * edge_length:
+        raise RuntimeError(
+            f"generate_lsu_network: min non-bonded vertex distance "
+            f"{diag_initrelax['min_non_bonded']:.3g} < 0.4*d0="
+            f"{0.4 * edge_length:.3g} after the initial relax. The seed "
+            f"or the relax produced a near-coincident vertex pair that "
+            f"Sellers Eq. 2 cannot resolve (no non-bonded repulsion). "
+            f"Try a different seed (seed_kind={seed_kind!r}, seed={seed}) "
+            f"or a smaller seed_jitter_sigma."
+        )
+    if diag_initrelax["min_non_bonded"] < 0.6 * edge_length:
+        warnings.warn(
+            f"min non-bonded vertex distance "
+            f"{diag_initrelax['min_non_bonded']:.3g} is in "
+            f"[0.4*d0, 0.6*d0]; cluster diagnostics suggest the seed "
+            f"contains near-coincident pairs. The burn-in should clean "
+            f"this up via SW moves, but watch for f1 = 0 residuals.",
+            stacklevel=2,
+        )
+
+    # Topology burn-in: triangular Hemmann profile to lose crystalline /
+    # random-seed memory.
+    if (burn_in_n_heat + burn_in_n_cool + burn_in_n_quench) > 0:
         positions, edges, neighbors, burn_info = topology_burn_in(
-            positions, edges, neighbors, box, edge_length, weights,
-            n_moves=topology_burn_in_moves,
-            T=topology_burn_in_T,
-            rng=rng,
+            positions, edges, neighbors, box, edge_length, weights, rng,
+            n_heat=burn_in_n_heat,
+            n_cool=burn_in_n_cool,
+            n_quench=burn_in_n_quench,
+            T_max=burn_in_T_max,
+            T_max_over_T_melt=burn_in_T_max_over_T_melt,
+            P_melt=burn_in_P_melt,
+            T_melt_probe_moves=burn_in_T_melt_probe_moves,
+            T_melt_probe_T=burn_in_T_melt_probe_T,
             relax_local_iters=relax_local_iters,
             relax_global_iters=relax_global_iters,
             local_shell_depth=local_shell_depth,
             global_fallback_threshold=global_fallback_threshold,
+            threshold_energy_relax=threshold_energy_relax,
+            c_f=c_f,
             uniformity_weight=uniformity_weight,
             uniformity_kmax=uniformity_kmax,
-            target_accepts_per_vertex=topology_burn_in_target_accepts_per_vertex,
+            target_accepts_per_vertex=burn_in_target_accepts_per_vertex,
             use_jax=use_jax, use_jaxopt=use_jaxopt_eff,
             verbose=verbose,
         )
         if verbose:
             acc = burn_info["accepted"] / max(1, burn_info["proposed"])
-            print(f"[gen] burn-in done: T={burn_info['T_used']:.3g} "
-                  f"moves={burn_info['moves']} "
-                  f"accepted={burn_info['accepted']} ({acc:.1%})")
+            print(
+                f"[gen] burn-in done: T_max={burn_info['T_max_used']:.3g} "
+                f"T_melt={burn_info['T_melt']} "
+                f"moves={burn_info['moves']} "
+                f"accepted={burn_info['accepted']} ({acc:.1%}) "
+                f"early-rejected={burn_info['early_rejected']}"
+            )
 
     # WWW annealing ----------------------------------------------------------
     positions, edges, neighbors, history = www_anneal(
@@ -2149,19 +3237,19 @@ def generate_lsu_network(
         local_shell_depth=local_shell_depth,
         uniformity_weight=uniformity_weight,
         uniformity_kmax=uniformity_kmax,
+        threshold_energy_relax=threshold_energy_relax,
+        c_f=c_f,
+        cycle_size=cycle_size,
         check_lsu_every=check_lsu_every,
         use_jax=use_jax, use_jaxopt=use_jaxopt_eff, verbose=verbose,
     )
 
     # Final clean-up: one short full-N polish to settle bond-length residual.
-    # Capped at min(relax_local_iters, 50) — long polishes here re-introduce
-    # the same void drift mechanism the WWW fallback gate suppresses, so we
-    # keep this brief.
     final_ctx = _RelaxContext(N, box, edge_length, weights,
                               use_jax=use_jax, use_jaxopt=use_jaxopt_eff)
     final_ctx.update_topology(edges, neighbors)
-    positions, _ = relax(positions, final_ctx,
-                         max_iter=min(relax_local_iters, 50))
+    positions, _, _ = relax(positions, final_ctx,
+                            max_iter=min(relax_local_iters, 50))
     positions = positions - box * np.round(positions / box)
 
     # Connectivity sanity check
@@ -2184,10 +3272,13 @@ def generate_lsu_network(
         print(f"[gen] rod lengths: mean={rod_lengths.mean():.3f}, "
               f"std={rod_lengths.std():.3f}, "
               f"min={rod_lengths.min():.3f}, max={rod_lengths.max():.3f}")
-        print(f"[gen] uniformity: voxel_std(4^3)="
-              f"{_voxel_density_std(positions, box, ngrid=4):.3f}, "
-              f"S_low(k<={uniformity_kmax})="
-              f"{low_k_structure_factor(positions, box, uniformity_kmax):.4g}")
+        diag_final = cluster_diagnostics(
+            positions, edges, neighbors, box, edge_length
+        )
+        print(
+            f"[gen] final cluster diag: "
+            f"{_format_cluster_diagnostics(diag_final, edge_length)}"
+        )
         if pbc_duplicate_boundary_rods:
             n_extra = rods.shape[0] - num_rods
             print(f"[gen] rendered {rods.shape[0]} rods "

@@ -53,8 +53,9 @@ Implemented in `crystal_seed_network` / `topology_burn_in`:
   Penalizes the central edge being out of the plane of the trihedron at
   either endpoint.
 
-Default weights from the paper: not explicitly given. We use α=β=γ=δ=1 as a
-reasonable starting point; user can tune.
+The paper does not print numeric weights; the values confirmed directly by
+the Sellers group are α=0.7, β=0.7, γ=0.3, δ=0.4, and these are the
+`generate_lsu_network` defaults.
 
 ## 3. WWW iteration (Supplement, Eq. 1 + Methods)
 1. Pick a random edge (i, j).
@@ -87,22 +88,27 @@ For each vertex pair (a, b) with b within `locality` edges of a:
       at each interior vertex, pick the assignment of (γ−1) child edges that
       maximizes sum of overlap dot products).
     - Score the alignment via Eq. 3:
-        f(T^a, T^b; σ) = (1 / |T_n^a|) · Σ_pairs (r^a · r^b) / (mean(|r^a|,|r^b|))^2
+        f(T^a, T^b; σ) = (1 / (|T_n^a| − 1)) · Σ_pairs (r^a · r^b) / (mean(|r^a|,|r^b|))^2
+      (|T_n^a| − 1 = number of edges in the tree: 3 at depth 1, 9 at depth 2.)
 (d) ϕ_ab = (1 / γ!) · Σ_σ f(T_n^a, T_n^b; σ)            (Eq. 1)
 
-Φ_nl = mean of {ϕ_ab : b within l edges of a, over all a}.
+Φ_nl = mean of {ϕ_ab : b within l edges of a, over all a}. The first
+subscript is the tree depth n, the second the locality l (Sellers Eq. 2;
+Fig. 3b plots Φ_12, Φ_22, Φ_32 — all at locality 2).
 
 For our trivalent case:
-- Φ_12: γ=3, depth 1, locality 1. Each tree has 3 edges; 3! = 6 permutations.
+- Φ_12: γ=3, depth 1, locality 2. Each tree has 3 edges; 3! = 6 permutations.
 - Φ_22: γ=3, depth 2, locality 2. Each tree has 3 + 6 = 9 edges; same 6 root
   permutations (interior pairings handled greedily by the depth-first heuristic).
 
 ## 5. PBC unwrapping for output
 Each rod's two endpoints can straddle a periodic boundary. The example file
-keeps one endpoint inside the canonical box `[-L/2, L/2]^3` and stores the
-second endpoint as `endpoint_inside + minimum_image_displacement`, which can
-extend outside the box by up to one rod length. We mirror this convention in
-the output array.
+stores every rod at full length: each face-crossing edge appears twice, once
+anchored at each endpoint's canonical-box image (the two rows are the same
+segment translated by a lattice vector), so either endpoint of a row may lie
+up to one rod length outside `[-L/2, L/2]^3`. We mirror this convention in
+the output array (`pbc_duplicate_boundary_rods=True`,
+`clip_endpoints_to_box=False`).
 
 ## 6. Periodic supercell vs. visible window
 The example has periodicity L = 11.44 µm, so the canonical box is

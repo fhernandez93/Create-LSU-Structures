@@ -118,7 +118,7 @@ def build_neighbors(N: int, edges: np.ndarray) -> np.ndarray:
 # with enough accepted moves the topology distribution is determined by the
 # Sellers energy, not by the seed. This is the Hemmann/Saba 2026 recipe;
 # combined with the burn-in it samples the same ensemble Sellers's refs
-# [27] (WWW 1985) and [28] (Mousseau-Barkema 2001) describe from a random
+# [27] (Barkema-Mousseau 2000) and [28] (WWW 1985) describe from a random
 # seed, but with markedly better-conditioned initial geometry.
 
 # Lattice entries each provide:
@@ -1346,6 +1346,7 @@ def relax(
     E_threshold: float = float("inf"),
     threshold_check_cycle_skip: int = 5,
     threshold_local_to_global_cycle: int = 10,
+    promote_margin: float = 0.1,
     c_f: float = 0.5,
     cycle_size: Optional[int] = None,
     on_global_promote: Optional[callable] = None,
@@ -1360,25 +1361,29 @@ def relax(
 
     When ``E_threshold`` is finite, runs L-BFGS in chunks of ``cycle_size``
     iterations (auto-defaulted to ``max(5, max_iter // 25)`` so a typical
-    relax does ~25 cycles, per Hemmann § 2.1 / Vink 2001 / BM2000). At each
-    cycle boundary:
+    relax does ~25 cycles, per Hemmann § 2.1). At each cycle boundary:
 
       - Query energy ``E`` and gradient ``g`` from ``ctx.value_and_grad``.
       - Compute ``|F|^2`` over moving DOFs only (Vink local-relax restricts
         the threshold check to the cluster).
       - BM2000 Eq. 4 estimator: ``E_f_est ≈ E - c_f * |F|^2``.
-      - If ``cycle_idx >= threshold_check_cycle_skip`` AND
-        ``E_f_est > E_threshold``: abort, return current state with
-        ``info["early_rejected"]=True``.
-      - If ``cycle_idx == threshold_local_to_global_cycle`` AND a moving
-        mask is set AND ``|E - E_threshold| < 0.1``: drop the mask via
-        ``ctx.set_moving_mask(None)`` and continue full-N from the current
-        point. Threshold checks remain enabled but ``|F|^2`` is now over
-        all DOFs (Hemmann § 2.1 quotes this verbatim).
-
-    The 5-cycle warm-up handles anharmonicities at the SW defect: BM2000
-    note that the harmonic ``E - c_f|F|^2`` underestimates ``E_f`` during
-    the first few relax steps and would prematurely reject good moves.
+      - Early rejection window (BM2000 / Hemmann § 2.1): abort with
+        ``info["early_rejected"]=True`` when ``E_f_est > E_threshold``,
+        but only for cycles in
+        ``(threshold_check_cycle_skip, threshold_local_to_global_cycle]``.
+        BM2000: "we do not reject any move during the first five steps of
+        relaxation" (anharmonic warm-up); Hemmann § 2.1: "After 10 cycles,
+        relaxation continues ... without early rejections."
+      - Local→global rescue (Vink PRB 64, 245214 § IV.B): at cycle
+        ``threshold_local_to_global_cycle``, if a moving mask is set and
+        the energy sits in the band ``[E_threshold,
+        E_threshold + promote_margin)`` — i.e. the frozen-shell boundary
+        strain is all that keeps the move above threshold — drop the mask
+        via ``ctx.set_moving_mask(None)`` and continue full-N ("we switch
+        from local to global relaxation when, during local relaxation, the
+        energy comes to within 0.1 eV of the threshold energy"). Moves
+        already below threshold stay local (Hemmann § 2.1 production runs
+        are entirely local for system-size independence).
     """
     if cycle_size is None:
         cycle_size = max(5, int(max_iter) // 25)
@@ -1419,8 +1424,18 @@ def relax(
         E, F_sq = _force_norm_sq_moving(ctx, pos_flat)
         # BM2000 Eq. 4 estimator.
         E_est = E - c_f * F_sq
-        # Threshold check (after warm-up).
-        if cycles_done > threshold_check_cycle_skip and E_est > E_threshold:
+        # Threshold check. Active only inside the window
+        # (warm-up, local_to_global]: BM2000 forbid rejections during the
+        # first five cycles (anharmonicities at the SW defect make the
+        # harmonic estimator unreliable), and Hemmann § 2.1 prescribes no
+        # early rejections after cycle 10 ("After 10 cycles, relaxation
+        # continues ... without early rejections").
+        if (
+            threshold_check_cycle_skip
+            < cycles_done
+            <= threshold_local_to_global_cycle
+            and E_est > E_threshold
+        ):
             info.update({
                 "n_iter_done": iters_done,
                 "force_norm_final": math.sqrt(F_sq),
@@ -1429,13 +1444,16 @@ def relax(
                 "E_estimate_at_abort": E_est,
             })
             return pos_flat.reshape(ctx.N, 3), E, info
-        # Local→global promotion at cycle 10 when E is within 0.1 of threshold
-        # (Hemmann § 2.1: "After 10 cycles, relaxation continues globally").
+        # Local→global rescue (Vink § IV.B): only when the energy is stuck
+        # in the band within `promote_margin` ABOVE the threshold — i.e.
+        # boundary strain held by the frozen shell is plausibly all that
+        # blocks acceptance. Moves already below threshold stay local
+        # (Hemmann § 2.1 keeps production relaxation entirely local).
         if (
             not promoted
             and cycles_done == threshold_local_to_global_cycle
             and ctx._mask_flat is not None
-            and abs(E - E_threshold) < 0.1
+            and 0.0 <= (E - E_threshold) < promote_margin
         ):
             if on_global_promote is not None:
                 on_global_promote(pos_flat.reshape(ctx.N, 3))
@@ -1529,9 +1547,12 @@ def stone_wales_apply(
     move: Tuple[int, Tuple[int, int, int, int], int],
 ) -> None:
     ek1, (i, c, j, d), ek2 = move
-    # edges (i,c) and (j,d) become (i,d) and (j,c)
-    edges[ek1] = (i, d)
-    edges[ek2] = (j, c)
+    # edges (i,c) and (j,d) become (i,d) and (j,c). Rows are written in
+    # canonical (min, max) order so that every writer preserves the seed
+    # invariant "edge rows sorted" and `stone_wales_revert` is an exact
+    # array-level inverse (not merely a graph-level one).
+    edges[ek1] = (i, d) if i < d else (d, i)
+    edges[ek2] = (j, c) if j < c else (c, j)
     _replace_neighbor(neighbors[i], c, d)
     _replace_neighbor(neighbors[j], d, c)
     _replace_neighbor(neighbors[c], i, j)
@@ -1544,8 +1565,8 @@ def stone_wales_revert(
     move: Tuple[int, Tuple[int, int, int, int], int],
 ) -> None:
     ek1, (i, c, j, d), ek2 = move
-    edges[ek1] = (i, c)
-    edges[ek2] = (j, d)
+    edges[ek1] = (i, c) if i < c else (c, i)
+    edges[ek2] = (j, d) if j < d else (d, j)
     _replace_neighbor(neighbors[i], d, c)
     _replace_neighbor(neighbors[j], c, d)
     _replace_neighbor(neighbors[c], j, i)
@@ -1599,9 +1620,11 @@ def www_anneal(
       4. Build the moving-shell mask (``local_shell_depth``, default 4),
          held fixed via gradient masking.
       5. Call ``relax(..., E_threshold=E_t)``: chunked L-BFGS with BM2000
-         Eq. 4 ``E_f_est = E - c_f * |F|^2`` early-rejection check,
-         5-cycle anharmonic warm-up, local→global promotion at cycle 10
-         when E is within 0.1 of the threshold (Hemmann § 2.1).
+         Eq. 4 ``E_f_est = E - c_f * |F|^2`` early-rejection checks active
+         only for cycles 6..10 (BM2000: no rejections during the first 5
+         cycles; Hemmann § 2.1: none after cycle 10), plus the Vink
+         local→global rescue at cycle 10 when E sits within 0.1 *above*
+         the threshold.
       6. If the relax aborted early (``info["early_rejected"]``), revert
          topology and positions and continue. **No Metropolis roll** —
          Vink's identity says this is exactly equivalent to a Metropolis
@@ -1728,7 +1751,7 @@ def www_anneal(
                 )
             if (
                 target_lsu is not None
-                and abs(phi - target_lsu) <= target_tolerance
+                and (abs(phi - target_lsu) <= target_tolerance or (target_lsu - phi) < 0)
             ):
                 if verbose:
                     print(f"[{log_tag}] target LSU {target_lsu} reached "
@@ -2059,41 +2082,42 @@ def _calibrate_T_melt(
     use_jaxopt: bool,
     verbose: bool,
 ) -> Tuple[float, int, int]:
-    """Estimate <ΔE_up> for Hemmann Eq. 5.
+    """Estimate ΔE_min for Hemmann Eq. 5: the relaxed energy cost of the
+    *energetically lowest* uphill bond switch of the CURRENT network.
 
-    Runs a short flat-T probe; collects the mean uphill ΔE across all
-    proposed (not just accepted) moves; returns
-    ``(mean_uphill_dE, accepted, proposed)``. The caller computes
-    ``T_melt = mean_uphill_dE / ln(1/P_melt)``.
+    Hemmann (Adv. Funct. Mater. 2026) § 2.3: "We define T_melt as the
+    temperature at which the energetically lowest bond switch and
+    relaxation are accepted with probability P_accept > P_melt := 0.1%.
+    Isolating T in the Metropolis acceptance probability yields the
+    melting temperature" — i.e. ``T_melt = ΔE_min / ln(1/P_melt)`` with
+    ``ΔE_min`` the smallest positive relaxed ΔE among candidate bond
+    switches of the *initial* configuration.
 
-    Hemmann Eq. 5: ``T_melt = <ΔE_up> / ln(1/P_melt)`` where ``<ΔE_up>``
-    is the mean uphill (accepted) ΔE — i.e. the natural energy scale on
-    which the Metropolis acceptance equals ``P_melt``. We sample it at a
-    ``probe_T`` chosen sufficiently above the cold regime that many
-    uphill moves are accepted (default 5.0 — much higher than the
-    production T0=1.0). ``probe_T`` itself does not appear in the
-    formula; it only determines how many uphill moves we observe in the
-    probe.
+    The probe therefore samples ``probe_moves`` random Stone-Wales
+    switches FROM THE UNCHANGED INPUT STATE: each candidate is applied,
+    locally relaxed (no threshold abort), measured, and reverted — never
+    accepted, no Metropolis evolution. ``probe_T`` is retained in the
+    signature for backwards compatibility but is no longer used.
+
+    Returns ``(min_uphill_dE, n_uphill, proposed)``. The caller computes
+    ``T_melt = min_uphill_dE / ln(1/P_melt)``.
     """
+    del probe_T  # unused — kept for backwards-compatible signature
     # Snapshot inputs so the probe does not mutate the caller's state.
-    pos_probe = positions.copy()
+    pos0 = positions.copy()
     edges_probe = edges.copy()
     neighbors_probe = neighbors.copy()
     probe_seed = int(rng.integers(0, 2**31 - 1))
 
-    # The www_anneal loop records E history at ``check_lsu_every`` strides,
-    # but we need per-move ΔE. Re-implement a minimal SW loop here that
-    # records the uphill ΔEs explicitly.
-    N = pos_probe.shape[0]
+    N = pos0.shape[0]
     ctx = _RelaxContext(N, box, d0, weights, use_jax=use_jax, use_jaxopt=use_jaxopt)
     ctx.update_topology(edges_probe, neighbors_probe)
-    E_curr = ctx.energy(pos_probe.reshape(-1))
-    obj_curr, _ = _acceptance_objective(
-        E_curr, pos_probe, box, uniformity_weight, uniformity_kmax
+    E0 = ctx.energy(pos0.reshape(-1))
+    obj0, _ = _acceptance_objective(
+        E0, pos0, box, uniformity_weight, uniformity_kmax
     )
     probe_rng = np.random.default_rng(probe_seed)
     uphill_dE_samples: list = []
-    accepted = 0
     proposed = 0
     for _ in range(probe_moves):
         move = stone_wales_propose(edges_probe, neighbors_probe, probe_rng)
@@ -2101,7 +2125,6 @@ def _calibrate_T_melt(
             continue
         proposed += 1
         _ek1, (sw_i, sw_c, sw_j, sw_d), _ek2 = move
-        pos_before = pos_probe.copy()
         stone_wales_apply(edges_probe, neighbors_probe, move)
         if not is_connected(N, edges_probe):
             stone_wales_revert(edges_probe, neighbors_probe, move)
@@ -2115,57 +2138,41 @@ def _calibrate_T_melt(
             ctx.set_moving_mask(shell)
         else:
             ctx.set_moving_mask(None)
-        # No threshold rejection during the probe — we need the full ΔE
-        # distribution.
+        # Full local relax — no threshold abort; we need the true relaxed ΔE.
         new_pos, E_new, _ = relax(
-            pos_probe, ctx, max_iter=relax_local_iters,
+            pos0, ctx, max_iter=relax_local_iters,
             E_threshold=float("inf"),
         )
         obj_new, _ = _acceptance_objective(
             E_new, new_pos, box, uniformity_weight, uniformity_kmax
         )
-        dE = obj_new - obj_curr
-        if dE > 0:
-            # Record EVERY proposed uphill dE — Hemmann's <ΔE_up> is the
-            # unbiased average over all uphill bond switches, not just the
-            # accepted subset (Metropolis biases that subset toward small
-            # ΔEs and would systematically under-estimate T_melt).
+        dE = obj_new - obj0
+        if dE > 1e-12:
             uphill_dE_samples.append(dE)
-            if probe_rng.random() < math.exp(-dE / max(probe_T, 1e-12)):
-                pos_probe = new_pos
-                E_curr = E_new
-                obj_curr = obj_new
-                accepted += 1
-            else:
-                stone_wales_revert(edges_probe, neighbors_probe, move)
-                ctx.update_topology(edges_probe, neighbors_probe)
-                pos_probe = pos_before
-        else:
-            # Downhill move: always accept (does not feed T_melt).
-            pos_probe = new_pos
-            E_curr = E_new
-            obj_curr = obj_new
-            accepted += 1
+        # Always revert: every candidate is probed from the same state.
+        stone_wales_revert(edges_probe, neighbors_probe, move)
+        ctx.update_topology(edges_probe, neighbors_probe)
+    ctx.set_moving_mask(None)
 
     if uphill_dE_samples:
-        mean_uphill = float(np.mean(uphill_dE_samples))
+        min_uphill = float(np.min(uphill_dE_samples))
     else:
-        # No accepted uphill move: probe_T was too low. Fall back to a
-        # generic estimate using the energy scale ``E_curr`` itself.
-        mean_uphill = max(1.0, abs(E_curr) * 0.1)
+        # No uphill candidate found (already-disordered state where every
+        # sampled switch is downhill). Fall back to a generic estimate
+        # using the energy scale ``E0`` itself.
+        min_uphill = max(1.0, abs(E0) * 0.1)
         if verbose:
             print(
-                f"[burn-in calibration] WARNING: no uphill moves accepted at "
-                f"probe_T={probe_T:.3g}; using fallback ΔE estimate {mean_uphill:.3g}"
+                f"[burn-in calibration] WARNING: no uphill switch among "
+                f"{proposed} probes; using fallback ΔE estimate {min_uphill:.3g}"
             )
     if verbose:
         print(
-            f"[burn-in calibration] probe_T={probe_T:.3g} "
-            f"accepted_uphill={len(uphill_dE_samples)}/"
-            f"{accepted}/{proposed} (uphill/total_acc/proposed) "
-            f"mean_uphill_dE={mean_uphill:.3g}"
+            f"[burn-in calibration] probed {proposed} switches from fixed "
+            f"state: uphill={len(uphill_dE_samples)}  "
+            f"min_uphill_dE={min_uphill:.3g} (Hemmann Eq. 5 basis)"
         )
-    return mean_uphill, accepted, proposed
+    return min_uphill, len(uphill_dE_samples), proposed
 
 
 def topology_burn_in(
@@ -2213,17 +2220,19 @@ def topology_burn_in(
     5-cycle anharmonic warm-up and local→global promotion at cycle 10.
 
     ``T_max`` is either user-supplied or auto-calibrated against the
-    melting temperature ``T_melt = <ΔE_up> / ln(1/P_melt)`` (Hemmann
-    Eq. 5). With ``T_max_over_T_melt = 1.15`` the schedule lands in the
-    hyperuniform regime Hemmann Figure 8c,d identifies
-    (``1.0 ≲ T_max/T_melt ≲ 1.3``).
+    melting temperature ``T_melt = ΔE_min / ln(1/P_melt)`` (Hemmann
+    Eq. 5, with ``ΔE_min`` the relaxed cost of the energetically lowest
+    uphill bond switch of the initial network — see
+    ``_calibrate_T_melt``). With ``T_max_over_T_melt = 1.15`` the
+    schedule lands in the hyperuniform regime Hemmann Figure 8c,d
+    identifies (``1.0 ≲ T_max/T_melt ≲ 1.3``).
 
     Returns
     -------
     positions, edges, neighbors, info
         ``info`` keys: ``T_max_used``, ``T_melt``, ``P_melt``, ``n_heat``,
         ``n_cool``, ``n_quench``, ``moves``, ``accepted``, ``proposed``,
-        ``early_rejected``, ``cluster_after``, ``probe_mean_uphill_dE``.
+        ``early_rejected``, ``cluster_after``, ``probe_min_uphill_dE``.
     """
     n_total = int(n_heat) + int(n_cool) + int(n_quench)
     if n_total <= 0:
@@ -2234,7 +2243,7 @@ def topology_burn_in(
             "cluster_after": cluster_diagnostics(
                 positions, edges, neighbors, box, d0
             ),
-            "probe_mean_uphill_dE": None,
+            "probe_min_uphill_dE": None,
         }
 
     # --- T_max calibration ---------------------------------------------- #
@@ -2374,7 +2383,7 @@ def topology_burn_in(
         "proposed": int(proposed_total),
         "early_rejected": int(early_rejected_total),
         "cluster_after": diag,
-        "probe_mean_uphill_dE": probe_uphill,
+        "probe_min_uphill_dE": probe_uphill,
     }
     return positions, edges, neighbors, info
 
@@ -2824,7 +2833,9 @@ def generate_lsu_network(
     Parameters
     ----------
     lsu_degree_12, lsu_degree_22 : float, optional
-        Target Φ_{1,1} or Φ_{2,2}. Provide exactly one of the two.
+        Target Φ_{1,2} or Φ_{2,2} (Sellers Eq. 2 convention: first
+        subscript = tree depth n, second = locality l, i.e. root vertices
+        within l edges of one another). Provide exactly one of the two.
     num_rods : int, optional
         Number of unique periodic-cell edges. Must be divisible by 3 so that
         the corresponding number of trivalent vertices V = 2·num_rods/3
@@ -2849,7 +2860,8 @@ def generate_lsu_network(
         Geometric temperature schedule for the Metropolis acceptance.
     energy_weights : dict, optional
         Mapping with keys ``alpha, beta, gamma, delta`` for the four energy
-        terms. Default: all 1.0.
+        terms. Default: the Sellers-group-confirmed weights
+        ``alpha=0.7, beta=0.7, gamma=0.3, delta=0.4``.
     target_tolerance : float
         Tolerance for early exit.
     check_lsu_every : int
@@ -2963,15 +2975,16 @@ def generate_lsu_network(
         faces. Set to False to suppress duplication and emit one rod per
         unique edge.
     clip_endpoints_to_box : bool
-        If True (default), the second endpoint of each rod (``p2``) is
-        clipped to the nearest box face along the rod direction whenever
-        it would extend outside the canonical box. The first endpoint is
-        always inside. Clipping does **not** change the structure rendered
-        by ``create_permittivity_grid_penlike`` (which clips at grid
-        bounds anyway), but it makes a centerline visualisation in
-        ParaView fit cleanly inside the cube outline. Set to False to
-        keep the historical behaviour where rods can extend up to one
-        bond length beyond the cube.
+        Default **False**, which matches the Sellers reference file
+        convention (``lsu_example_ends.txt`` stores full-length rods whose
+        endpoints extend up to one bond length beyond the cube). If True,
+        the second endpoint of each rod (``p2``) is clipped to the nearest
+        box face along the rod direction whenever it would extend outside
+        the canonical box; the first endpoint is always inside. Clipping
+        does **not** change the structure rendered by
+        ``create_permittivity_grid_penlike`` (which clips at grid bounds
+        anyway), but it makes a centerline visualisation in ParaView fit
+        cleanly inside the cube outline.
     verbose : bool
         Print progress every ``check_lsu_every`` iterations.
 
@@ -3013,16 +3026,21 @@ def generate_lsu_network(
     box = coerce_box(bounds_microns)
     use_jax = HAS_JAX if use_jax is None else (use_jax and HAS_JAX)
     weights_dict = energy_weights or {}
+    # Defaults are the energy weights confirmed by the Sellers group for
+    # the Eq. 2 functional: alpha=0.7, beta=0.7, gamma=0.3, delta=0.4.
     weights = (
-        float(weights_dict.get("alpha", 10.0)),
-        float(weights_dict.get("beta", 1.0)),
-        float(weights_dict.get("gamma", 1.0)),
-        float(weights_dict.get("delta", 1.0)),
+        float(weights_dict.get("alpha", 0.7)),
+        float(weights_dict.get("beta", 0.7)),
+        float(weights_dict.get("gamma", 0.3)),
+        float(weights_dict.get("delta", 0.4)),
     )
 
     if lsu_degree_12 is not None:
         target_lsu = float(lsu_degree_12)
-        target_depth, target_locality = 1, 1
+        # Sellers Eq. 2: Φ_nl = depth-n trees, root vertices within l
+        # edges. Φ_12 ⇒ depth 1, locality 2 (Fig. 3b plots Φ_12, Φ_22,
+        # Φ_32 — all at locality 2).
+        target_depth, target_locality = 1, 2
     else:
         target_lsu = float(lsu_degree_22)
         target_depth, target_locality = 2, 2

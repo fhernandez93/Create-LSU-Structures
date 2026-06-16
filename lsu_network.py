@@ -1665,6 +1665,18 @@ def www_anneal(
     objective_curr, S_low_curr = _acceptance_objective(
         E_curr, positions, box, uniformity_weight, uniformity_kmax
     )
+    # Seed's starting LSU, used to make the early-exit direction-aware: a
+    # crystalline seed (Phi ~ 1.0) descends toward the target as it disorders,
+    # whereas a random seed (Phi ~ 0.5) ascends toward it as it anneals. The
+    # exit must trigger when Phi reaches the target from whichever side it
+    # began on; a single fixed sign mis-fires for one of the two directions.
+    phi_start: Optional[float] = None
+    if target_lsu is not None and check_lsu_every > 0:
+        phi_start = compute_lsu(
+            positions, edges, neighbors, box,
+            depth=target_depth, locality=target_locality,
+            max_pairs=2000, rng=rng,
+        )
     history: Dict = {
         "iter": [], "T": [], "E": [], "objective": [],
         "uniformity_S": [], "lsu": [],
@@ -1749,15 +1761,22 @@ def www_anneal(
                     f"fb={fb_rate:.2%}  promote={promote_count}  "
                     f"elapsed={time.time()-t_start:.1f}s"
                 )
-            if (
-                target_lsu is not None
-                and (abs(phi - target_lsu) <= target_tolerance or (target_lsu - phi) < 0)
-            ):
-                if verbose:
-                    print(f"[{log_tag}] target LSU {target_lsu} reached "
-                          f"(measured {phi:.4f}); stopping.")
-                early_exit_triggered = True
-                break
+            if target_lsu is not None:
+                reached = abs(phi - target_lsu) <= target_tolerance
+                if phi_start is not None and phi_start >= target_lsu:
+                    # Descending (crystalline seed): stop once Phi has fallen
+                    # to/through the target.
+                    reached = reached or (phi <= target_lsu)
+                elif phi_start is not None:
+                    # Ascending (random seed): stop once Phi has risen
+                    # to/through the target.
+                    reached = reached or (phi >= target_lsu)
+                if reached:
+                    if verbose:
+                        print(f"[{log_tag}] target LSU {target_lsu} reached "
+                              f"(measured {phi:.4f}); stopping.")
+                    early_exit_triggered = True
+                    break
 
         move = stone_wales_propose(edges, neighbors, rng)
         if move is None:

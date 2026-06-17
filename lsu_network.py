@@ -451,18 +451,26 @@ def crystal_seed_network(
 # clusters that the Sellers Eq. 2 energy cannot spontaneously remove (it has
 # no non-bonded repulsion).
 #
-# BM2000's published algorithm targets Z=4 amorphous Si. We adapt it to Z=3
-# faithfully:
+# BM2000's published algorithm targets Z=4 amorphous Si; BM's literal
+# loop-expansion move (replace bond BC with AB+AC) is intrinsically a Z=4
+# recipe, so for Z=3 we reproduce BM's *properties* rather than its exact
+# move:
 #   - Place N points with min-separation `min_separation_frac * d0` (BM2000:
-#     2.3 Å vs Si–Si d=2.35 Å, i.e. ≈ 0.979).
+#     2.3 Å vs Si–Si d=2.35 Å, i.e. ≈ 0.979).  [faithful]
 #   - Build a Hamiltonian cycle through all N points using nearest-neighbour
-#     traversal. Every vertex starts at degree 2.
-#   - Loop expansion to Z=3: add N/2 more edges. For Z=3, every needed
-#     addition is a *direct* pairing of two deg-2 vertices, not a BM2000
-#     Eq. 2 swap (those are only needed when the target valency exceeds
-#     2 + 1). We grow `rc` whenever direct pairing stalls.
+#     traversal. Every vertex starts at degree 2.  [a Z=3 scaffold standing
+#     in for BM's "loop visiting all atoms"; not the literal BC->AB+AC move]
+#   - Loop expansion to Z=3: add N/2 more edges by direct pairing of deg-2
+#     vertices within a growing `rc`, REJECTING any pairing that would close
+#     a 3- or 4-ring (girth >= 5). This re-imports BM2000 §II.B's "no
+#     four-membered rings" rule that the bare scaffold otherwise lacked;
+#     5-rings are allowed (a-Si CRNs are 5-ring-rich) and the WWW anneal
+#     shapes the final 5-vs-6 distribution. We grow `rc` when pairing stalls.
+#   - BM2000's close-pair/short-bond cleanup is a POST-relaxation step
+#     ("in the beginning of this first quench"), so it is intentionally NOT
+#     done here; the downstream L-BFGS + WWW anneal handle it.
 #   - Final invariants identical to `crystal_seed_network`: deg==3
-#     everywhere, `is_connected`, edges canonicalised.
+#     everywhere, `is_connected`, edges canonicalised; plus zero triangles.
 def random_seed_network_bm2000(
     N: int,
     box: Union[float, Tuple[float, float, float], np.ndarray],
@@ -490,9 +498,10 @@ def random_seed_network_bm2000(
     3. **Loop expansion to Z=3.** Pair deg-2 vertices: for each
        under-coordinated vertex ``i`` in random order, bond it to its
        nearest deg-2 partner ``j`` within ``rc`` such that ``(i, j)`` is
-       not already an edge. When no progress is made at the current
-       ``rc``, grow ``rc`` by ``rc_grow_frac * d0`` and retry. Continues
-       until every vertex has degree 3 or ``rc`` exceeds
+       not already an edge AND closes no 3- or 4-ring (girth >= 5,
+       re-importing BM2000 §II.B's no-four-ring rule). When no progress is
+       made at the current ``rc``, grow ``rc`` by ``rc_grow_frac * d0`` and
+       retry. Continues until every vertex has degree 3 or ``rc`` exceeds
        ``rc_max_frac * d0``.
     4. **Invariants.** Same as ``crystal_seed_network``: ``deg == 3``
        everywhere, ``is_connected``, edges canonicalised ``(min, max)``
@@ -556,6 +565,26 @@ def random_seed_network_bm2000(
 
     def _degree(i: int) -> int:
         return len(nbr_sets[i])
+
+    def _would_make_short_ring(a: int, b: int, max_ring: int) -> bool:
+        """True if bonding (a, b) would close a ring of size <= max_ring.
+
+        BM2000 (Phys. Rev. B 62, 4985) §II.B disallows 4-membered rings;
+        3-membered rings (triangles) never occur in a CRN (the reference
+        gyroid is girth-6). Only the 2-neighbourhood is inspected, O(deg^2)
+        <= 9 ops for Z<=3. ``max_ring=3`` forbids only triangles; ``4`` also
+        forbids squares. 5-rings are intentionally allowed (a-Si CRNs are
+        5-ring-rich; the WWW anneal shapes the final 5-vs-6 distribution).
+        """
+        na = nbr_sets[a]
+        nb = nbr_sets[b]
+        if na & nb:
+            return True                       # common neighbour -> 3-ring
+        if max_ring >= 4:
+            for x in na:
+                if nbr_sets[x] & nb:
+                    return True               # a-x-y-b path -> 4-ring
+        return False
 
     def _tree() -> cKDTree:
         pos_shift = positions + box_arr / 2.0
@@ -657,6 +686,8 @@ def random_seed_network_bm2000(
                     continue
                 if j in nbr_sets[i]:
                     continue
+                if _would_make_short_ring(i, j, 4):
+                    continue  # girth >= 5: reject 3- and 4-rings (BM2000 §II.B)
                 chosen = j
                 break
             if chosen >= 0:
@@ -691,29 +722,37 @@ def random_seed_network_bm2000(
                 f"[bm2000 seed] {len(leftover)} stragglers; "
                 f"force-pairing them across PBC"
             )
-        # Greedily pair the closest two stragglers, repeat.
+        # Greedily pair the closest two stragglers, repeat. Prefer pairings
+        # that close no 3- or 4-ring (girth >= 5); if none exist among the
+        # remaining stragglers, relax to allow a 4-ring but NEVER a triangle
+        # (BM2000 §II.B tolerates the few 4-rings, which the WWW anneal then
+        # removes). 3-rings are forbidden unconditionally.
         while len(leftover) >= 2:
-            # Compute pairwise PBC distances among leftovers; pick the
-            # closest pair that aren't already bonded.
             best = (-1, -1, float("inf"))
-            for ii, a in enumerate(leftover):
-                for b in leftover[ii + 1:]:
-                    if b in nbr_sets[a]:
-                        continue
-                    d_ab = float(np.linalg.norm(
-                        pbc_displacement(
-                            positions[a] - positions[b], box_arr
-                        )
-                    ))
-                    if d_ab < best[2]:
-                        best = (a, b, d_ab)
+            for max_ring in (4, 3):
+                for ii, a in enumerate(leftover):
+                    for b in leftover[ii + 1:]:
+                        if b in nbr_sets[a]:
+                            continue
+                        if _would_make_short_ring(a, b, max_ring):
+                            continue
+                        d_ab = float(np.linalg.norm(
+                            pbc_displacement(
+                                positions[a] - positions[b], box_arr
+                            )
+                        ))
+                        if d_ab < best[2]:
+                            best = (a, b, d_ab)
+                if best[0] >= 0:
+                    break  # found a legal pair at this girth level
             if best[0] < 0:
-                # No legal pairing — would only happen if leftovers form a
-                # complete clique already (impossible for >2 leftovers at
-                # deg-2 since their two existing bonds are within the cycle).
+                # Only reachable if every remaining straggler pair would
+                # close a triangle — extremely rare. Re-seed (different
+                # `seed`) rather than emit a 3-ring.
                 raise RuntimeError(
                     f"random_seed_network_bm2000: stragglers "
-                    f"{leftover} cannot be paired without duplicate edges."
+                    f"{leftover} cannot be paired without creating a "
+                    f"triangle; retry with a different `seed`."
                 )
             a, b, d_ab = best
             _add_edge(a, b)
@@ -753,6 +792,19 @@ def random_seed_network_bm2000(
             "random_seed_network_bm2000: final network is disconnected."
         )
 
+    # Girth-guard verification: the loop-expansion/fallback guard forbids
+    # triangles everywhere, so a clean build has zero 3-rings (BM2000 §II.B;
+    # the reference gyroid is girth-6). A non-zero count is a guard bug.
+    n_triangles = 0
+    for a, b in edges_arr:
+        n_triangles += len(nbr_sets[int(a)] & nbr_sets[int(b)])
+    n_triangles //= 3
+    if n_triangles != 0:
+        raise RuntimeError(
+            f"random_seed_network_bm2000: built {n_triangles} triangle(s); "
+            f"the girth guard failed (internal bug)."
+        )
+
     # Compute mean bond length (PBC minimum image).
     bond_d = pbc_displacement(
         positions[edges_arr[:, 1]] - positions[edges_arr[:, 0]], box_arr
@@ -767,6 +819,7 @@ def random_seed_network_bm2000(
         "outer_passes": int(outer_passes),
         "min_separation_frac": float(placement_min_frac),
         "cycle_max_step": float(cycle_max_step),
+        "n_triangles": int(n_triangles),
     }
     return positions, edges_arr, meta
 

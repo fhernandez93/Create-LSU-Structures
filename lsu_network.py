@@ -481,6 +481,9 @@ def random_seed_network_bm2000(
     rc_grow_frac: float = 0.05,
     rc_max_frac: float = 6.00,
     max_outer_passes: int = 10_000,
+    long_bond_frac: float = 1.5,
+    max_2opt_passes: int = 400,
+    twoopt_k: int = 24,
     verbose: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, Dict]:
     """Build a random Z=3 seed network via BM2000 (Phys. Rev. B 62, 4985) § II.A.
@@ -565,6 +568,33 @@ def random_seed_network_bm2000(
 
     def _degree(i: int) -> int:
         return len(nbr_sets[i])
+
+    def _remove_edge(a: int, b: int) -> None:
+        nbr_sets[a].discard(b)
+        nbr_sets[b].discard(a)
+
+    def _bond(a: int, b: int) -> None:
+        nbr_sets[a].add(b)
+        nbr_sets[b].add(a)
+
+    def _connected_now() -> bool:
+        seen = np.zeros(N, dtype=bool)
+        stack = [0]
+        seen[0] = True
+        cnt = 1
+        while stack:
+            uu = stack.pop()
+            for ww in nbr_sets[uu]:
+                if not seen[ww]:
+                    seen[ww] = True
+                    cnt += 1
+                    stack.append(ww)
+        return cnt == N
+
+    def _dist(a: int, b: int) -> float:
+        return float(np.linalg.norm(
+            pbc_displacement(positions[a] - positions[b], box_arr)
+        ))
 
     def _would_make_short_ring(a: int, b: int, max_ring: int) -> bool:
         """True if bonding (a, b) would close a ring of size <= max_ring.
@@ -658,6 +688,11 @@ def random_seed_network_bm2000(
         )
 
     # --- Step 3: loop expansion to Z=3 ---------------------------------- #
+    # Global ascending-distance greedy matching of the deg-2 vertices: collect
+    # every candidate pair within rc, sort by PBC distance, and accept the
+    # shortest valid (deg<3, not already bonded, girth >= 5) pair first. This
+    # is far better than per-vertex greedy -- it minimises long chords by
+    # construction, so rc rarely has to grow and few stragglers remain.
     rc = rc_start_frac * d0
     outer_passes = 0
 
@@ -665,35 +700,31 @@ def random_seed_network_bm2000(
         outer_passes += 1
         progress = False
 
-        order = np.flatnonzero(deg < 3)
-        rng.shuffle(order)
-        for i in order:
-            i = int(i)
-            if _degree(i) >= 3:
-                continue
-            # Query nearest neighbours; pick the nearest deg-2 vertex within
-            # rc that isn't already bonded to i.
-            k_query = min(N, max(16, 8 + 4 * outer_passes))
-            dists, idxs = tree.query(pos_shift_all[i], k=k_query)
-            chosen = -1
-            for d_ij, j in zip(np.atleast_1d(dists), np.atleast_1d(idxs)):
-                j = int(j)
-                if j == i:
+        if (deg == 3).all():
+            break
+
+        # All vertex pairs within rc (PBC); keep those with both ends deg<3.
+        cand = tree.query_pairs(r=rc, output_type="ndarray")
+        if cand.size:
+            is_d2 = deg < 3
+            cand = cand[is_d2[cand[:, 0]] & is_d2[cand[:, 1]]]
+        if cand.size:
+            dvec = pbc_displacement(
+                positions[cand[:, 0]] - positions[cand[:, 1]], box_arr
+            )
+            order = np.argsort(np.linalg.norm(dvec, axis=1))
+            for idx in order:
+                u = int(cand[idx, 0])
+                v = int(cand[idx, 1])
+                if _degree(u) >= 3 or _degree(v) >= 3:
+                    continue  # consumed earlier this pass
+                if v in nbr_sets[u]:
                     continue
-                if d_ij > rc:
-                    break  # query results are sorted by distance
-                if _degree(j) >= 3:
-                    continue
-                if j in nbr_sets[i]:
-                    continue
-                if _would_make_short_ring(i, j, 4):
+                if _would_make_short_ring(u, v, 4):
                     continue  # girth >= 5: reject 3- and 4-rings (BM2000 §II.B)
-                chosen = j
-                break
-            if chosen >= 0:
-                _add_edge(i, chosen)
-                deg[i] += 1
-                deg[chosen] += 1
+                _add_edge(u, v)
+                deg[u] += 1
+                deg[v] += 1
                 progress = True
 
         if (deg == 3).all():
@@ -727,6 +758,65 @@ def random_seed_network_bm2000(
         # remaining stragglers, relax to allow a 4-ring but NEVER a triangle
         # (BM2000 §II.B tolerates the few 4-rings, which the WWW anneal then
         # removes). 3-rings are forbidden unconditionally.
+        def _augment_pair(i: int, j: int) -> bool:
+            """Raise two deg-2 stragglers (i, j) to deg-3 when a direct (i, j)
+            bond would close a triangle. Augmenting move: remove an existing
+            edge (x, y) near them and add {(i, x), (j, y)} or {(i, y), (j, x)}.
+            This keeps x, y at deg-3 and pushes no deficit forward, while
+            respecting girth >= 5 and connectivity. Returns True on success."""
+            cand: set[int] = set()
+            for src in (i, j):
+                _, idxs = tree.query(pos_shift_all[src], k=min(N, 32))
+                cand.update(int(t) for t in np.atleast_1d(idxs))
+            cand.discard(i)
+            cand.discard(j)
+            best_score = float("inf")
+            best_move = None  # (x, y, (a1, b1), (a2, b2))
+            for x in cand:
+                for y in tuple(nbr_sets[x]):
+                    if len({i, j, x, y}) != 4:
+                        continue
+                    for (a1, b1), (a2, b2) in (
+                        ((i, x), (j, y)),
+                        ((i, y), (j, x)),
+                    ):
+                        if b1 in nbr_sets[a1] or b2 in nbr_sets[a2]:
+                            continue
+                        score = _dist(a1, b1) + _dist(a2, b2)
+                        if score >= best_score:
+                            continue
+                        # Transactional girth check (old edge removed).
+                        _remove_edge(x, y)
+                        ok = not _would_make_short_ring(a1, b1, 4)
+                        if ok:
+                            _bond(a1, b1)
+                            ok = not _would_make_short_ring(a2, b2, 4)
+                            _remove_edge(a1, b1)
+                        _bond(x, y)
+                        if ok:
+                            best_score = score
+                            best_move = (x, y, (a1, b1), (a2, b2))
+            if best_move is None:
+                return False
+            x, y, (a1, b1), (a2, b2) = best_move
+            _remove_edge(x, y)
+            _bond(a1, b1)
+            _bond(a2, b2)
+            if not _connected_now():
+                # Revert and reject this move.
+                _remove_edge(a1, b1)
+                _remove_edge(a2, b2)
+                _bond(x, y)
+                return False
+            deg[i] += 1
+            deg[j] += 1  # x, y net unchanged
+            if verbose:
+                print(
+                    f"[bm2000 seed] augment-relinked stragglers ({i}, {j}) "
+                    f"by breaking edge ({x}, {y})"
+                )
+            return True
+
         while len(leftover) >= 2:
             best = (-1, -1, float("inf"))
             for max_ring in (4, 3):
@@ -746,14 +836,18 @@ def random_seed_network_bm2000(
                 if best[0] >= 0:
                     break  # found a legal pair at this girth level
             if best[0] < 0:
-                # Only reachable if every remaining straggler pair would
-                # close a triangle — extremely rare. Re-seed (different
-                # `seed`) rather than emit a 3-ring.
-                raise RuntimeError(
-                    f"random_seed_network_bm2000: stragglers "
-                    f"{leftover} cannot be paired without creating a "
-                    f"triangle; retry with a different `seed`."
-                )
+                # Every remaining straggler pair would close a triangle.
+                # Augment-relink the first two stragglers via a broken edge
+                # instead of emitting a 3-ring or re-seeding.
+                i, j = int(leftover[0]), int(leftover[1])
+                if not _augment_pair(i, j):
+                    raise RuntimeError(
+                        f"random_seed_network_bm2000: stragglers "
+                        f"{leftover} cannot be paired or augment-relinked "
+                        f"without a triangle; retry with a different `seed`."
+                    )
+                leftover = [v for v in leftover if deg[v] < 3]
+                continue
             a, b, d_ab = best
             _add_edge(a, b)
             deg[a] += 1
@@ -777,6 +871,98 @@ def random_seed_network_bm2000(
         raise RuntimeError(
             f"random_seed_network_bm2000: vertex {bad} has degree {deg[bad]} "
             f"(expected 3) after force-pair fallback."
+        )
+
+    # --- Step 3b: 2-opt long-bond cleanup ------------------------------- #
+    # The Hamiltonian closing edge and rc-grown / force-paired chords can
+    # leave bonds several d0 long. A long bond is a *topological* defect: no
+    # position relaxation can shorten it, because Sellers Eq. 2 has no
+    # non-bonded repulsion -- contracting it would drag the endpoints through
+    # neighbouring vertices and collapse them (the min_non_bonded < 0.4*d0
+    # hard fail in generate_lsu_network). Remove long bonds at the source
+    # with degree-preserving 2-opt swaps: replace a long edge (u, v) and a
+    # nearby edge (x, y) with the shorter reconnection {(u, x), (v, y)} or
+    # {(u, y), (v, x)}, keeping deg==3 everywhere, girth >= 5 (no 3-/4-rings,
+    # BM2000 §II.B) and global connectivity. Longest-first, first-improvement,
+    # iterated until no edge exceeds long_bond_frac*d0 or no improving swap
+    # exists. Each accepted swap strictly shortens the worst bond, so the
+    # loop terminates.
+    L_long = float(long_bond_frac) * d0
+    tree2 = _tree()
+
+    def _try_swap(u: int, v: int, d_uv: float) -> bool:
+        """Apply the best valid 2-opt that shortens edge (u, v). Greedy
+        first-improvement: returns True and leaves nbr_sets mutated on the
+        first accepted swap; False if none found."""
+        cand_verts: set[int] = set()
+        for src in (u, v):
+            _, idxs = tree2.query(pos_shift_all[src], k=min(N, twoopt_k))
+            cand_verts.update(int(t) for t in np.atleast_1d(idxs))
+        cand_verts.discard(u)
+        cand_verts.discard(v)
+        for x in cand_verts:
+            for y in tuple(nbr_sets[x]):
+                if len({u, v, x, y}) != 4:
+                    continue
+                # Two degree-preserving reconnections of {u,v,x,y}.
+                for (a1, b1), (a2, b2) in (
+                    ((u, x), (v, y)),
+                    ((u, y), (v, x)),
+                ):
+                    if b1 in nbr_sets[a1] or b2 in nbr_sets[a2]:
+                        continue  # would duplicate an existing edge
+                    new_max = max(_dist(a1, b1), _dist(a2, b2))
+                    if new_max >= d_uv:
+                        continue  # must strictly shorten the long bond
+                    # Transactional validity check: remove old, test girth on
+                    # the new pair, then connectivity; revert on any failure.
+                    _remove_edge(u, v)
+                    _remove_edge(x, y)
+                    ok = not _would_make_short_ring(a1, b1, 4)
+                    if ok:
+                        _bond(a1, b1)
+                        ok = not _would_make_short_ring(a2, b2, 4)
+                        if ok:
+                            _bond(a2, b2)
+                            if _connected_now():
+                                return True  # accept; leave applied
+                            _remove_edge(a2, b2)
+                        _remove_edge(a1, b1)
+                    # revert
+                    _bond(u, v)
+                    _bond(x, y)
+        return False
+
+    n_2opt_swaps = 0
+    for _pass in range(max_2opt_passes):
+        edge_lengths = sorted(
+            ((_dist(i, j), i, j) for i in range(N) for j in nbr_sets[i] if i < j),
+            reverse=True,
+        )
+        if not edge_lengths or edge_lengths[0][0] <= L_long:
+            break
+        progressed = False
+        for d_uv, u, v in edge_lengths:
+            if d_uv <= L_long:
+                break
+            if _try_swap(u, v, d_uv):
+                n_2opt_swaps += 1
+                progressed = True
+                break  # re-sort after each accepted swap
+        if not progressed:
+            break  # no improving swap for any long edge
+
+    # Rebuild the edge list from nbr_sets (Step 3b mutated the adjacency in
+    # place; edges_list is now stale).
+    edges_list = [(i, j) for i in range(N) for j in nbr_sets[i] if i < j]
+    if verbose:
+        residual = sorted(
+            (_dist(i, j) for (i, j) in edges_list), reverse=True
+        )
+        print(
+            f"[bm2000 seed] 2-opt cleanup: {n_2opt_swaps} swaps, "
+            f"max bond now {residual[0] / d0:.2f}*d0 "
+            f"(target <= {long_bond_frac:.2f}*d0)"
         )
 
     # --- Step 4: invariants --------------------------------------------- #
@@ -822,6 +1008,324 @@ def random_seed_network_bm2000(
         "n_triangles": int(n_triangles),
     }
     return positions, edges_arr, meta
+
+
+def soft_start_seed_relax(
+    positions: np.ndarray,
+    edges: np.ndarray,
+    box: Union[float, Tuple[float, float, float], np.ndarray],
+    d0: float,
+    *,
+    r_rep_frac: float = 0.9,
+    k_rep: float = 1.0,
+    n_outer: int = 12,
+    inner_iter: int = 60,
+    target_min_nb_frac: float = 0.6,
+    bond_max_frac: float = 1.6,
+    verbose: bool = False,
+) -> Tuple[np.ndarray, Dict]:
+    """Spread a raw random seed before the (repulsion-free) Sellers relax.
+
+    The BM2000 loop-expansion can leave bonds several ``d0`` long (the
+    girth->=5 pairing grows ``rc`` up to its cap, and the straggler fallback
+    stitches pairs across the box). The Sellers Eq. 2 energy has **no
+    non-bonded repulsion** (see the module note above
+    ``random_seed_network_bm2000``), so the first L-BFGS relax contracts
+    those long bonds straight *through* neighbouring vertices and collapses
+    them into near-coincident clusters -- the ``min_non_bonded < 0.4*d0``
+    hard fail in ``generate_lsu_network``.
+
+    This pre-relax uses a self-contained potential -- harmonic bond springs
+    toward ``d0`` plus a one-sided soft-sphere repulsion on non-bonded pairs
+    closer than ``r_rep_frac * d0`` -- to contract the long bonds *without*
+    letting vertices cross. It mirrors the repulsive/Keating equilibration
+    that Sellers's cited random-seed refs (Vink 2001; Mousseau-Barkema 2001)
+    apply before WWW. It runs ONLY on the seed; the downstream relax and WWW
+    anneal still see the pure Eq. 2 functional, so the production protocol is
+    unchanged.
+
+    The non-bonded pair list is rebuilt each outer pass (cKDTree under PBC)
+    so pairs that newly close as long bonds contract are caught; each inner
+    L-BFGS solve sees a frozen pair list (a smooth objective).
+
+    Returns ``(positions, info)`` where ``info`` reports the min non-bonded
+    separation before/after, the final max bond length, and the outer-pass
+    count.
+    """
+    box_arr = coerce_box(box)
+    N = positions.shape[0]
+    pos = positions.astype(np.float64).copy()
+    e0 = edges[:, 0].astype(np.int64)
+    e1 = edges[:, 1].astype(np.int64)
+    edge_set = {(int(a), int(b)) if a < b else (int(b), int(a)) for a, b in edges}
+    r_rep = float(r_rep_frac) * float(d0)
+    target_min_nb = float(target_min_nb_frac) * float(d0)
+
+    def _tree(p: np.ndarray) -> cKDTree:
+        shift = np.clip(p + box_arr / 2.0, 0.0, box_arr - 1e-12)
+        return cKDTree(shift, boxsize=box_arr)
+
+    def _min_non_bonded(p: np.ndarray) -> float:
+        tree = _tree(p)
+        for r_q in (0.7 * d0, 1.2 * d0, 2.0 * d0):
+            cand = tree.query_pairs(r=r_q, output_type="ndarray")
+            if cand.size == 0:
+                continue
+            cand = np.sort(cand, axis=1)
+            keep = np.array([(int(a), int(b)) not in edge_set for a, b in cand])
+            cand = cand[keep]
+            if cand.shape[0] == 0:
+                continue
+            dd = np.linalg.norm(
+                pbc_displacement(p[cand[:, 0]] - p[cand[:, 1]], box_arr), axis=1
+            )
+            return float(dd.min())
+        return float("inf")
+
+    def _rep_pairs(p: np.ndarray) -> np.ndarray:
+        cand = _tree(p).query_pairs(r=r_rep, output_type="ndarray")
+        if cand.size == 0:
+            return np.empty((0, 2), dtype=np.int64)
+        cand = np.sort(cand, axis=1)
+        keep = np.array([(int(a), int(b)) not in edge_set for a, b in cand])
+        return cand[keep]
+
+    def _bond_lengths(p: np.ndarray) -> np.ndarray:
+        return np.linalg.norm(pbc_displacement(p[e1] - p[e0], box_arr), axis=1)
+
+    def _energy_grad(x: np.ndarray, rep: np.ndarray):
+        p = x.reshape(N, 3)
+        g = np.zeros((N, 3), dtype=np.float64)
+        # Harmonic bonds toward d0.
+        dvec = pbc_displacement(p[e1] - p[e0], box_arr)
+        L = np.linalg.norm(dvec, axis=1)
+        Lsafe = np.maximum(L, 1e-12)
+        E = float(np.sum((L - d0) ** 2))
+        coef = (2.0 * (L - d0) / Lsafe)[:, None] * dvec  # dE/dp[e1]
+        np.add.at(g, e1, coef)
+        np.add.at(g, e0, -coef)
+        # One-sided soft-sphere repulsion on close non-bonded pairs.
+        if rep.shape[0]:
+            ra, rb = rep[:, 0], rep[:, 1]
+            rvec = pbc_displacement(p[rb] - p[ra], box_arr)
+            Lr = np.linalg.norm(rvec, axis=1)
+            overlap = r_rep - Lr
+            active = overlap > 0.0
+            if np.any(active):
+                E += float(k_rep * np.sum(overlap[active] ** 2))
+                Lrsafe = np.maximum(Lr, 1e-12)
+                gco = (-2.0 * k_rep * overlap / Lrsafe)[:, None] * rvec
+                gco[~active] = 0.0
+                np.add.at(g, rb, gco)
+                np.add.at(g, ra, -gco)
+        return E, g.reshape(-1)
+
+    min_nb_before = _min_non_bonded(pos)
+    outer = 0
+    for outer in range(1, n_outer + 1):
+        rep = _rep_pairs(pos)
+        res = minimize(
+            _energy_grad, pos.reshape(-1), args=(rep,), jac=True,
+            method="L-BFGS-B", options={"maxiter": inner_iter, "gtol": 1e-8},
+        )
+        pos = res.x.reshape(N, 3)
+        pos = pos - box_arr * np.round(pos / box_arr)
+        cur = _min_non_bonded(pos)
+        bond_max = float(_bond_lengths(pos).max())
+        if verbose:
+            print(
+                f"[soft-start] outer={outer} min_nb={cur / d0:.3f}d0 "
+                f"bond_max={bond_max / d0:.2f}d0 rep_pairs={rep.shape[0]}"
+            )
+        if cur >= target_min_nb and bond_max <= bond_max_frac * d0:
+            break
+    info = {
+        "min_nb_before": float(min_nb_before),
+        "min_nb_after": float(_min_non_bonded(pos)),
+        "bond_max_after": float(_bond_lengths(pos).max()),
+        "outer_passes": int(outer),
+    }
+    return pos, info
+
+
+def settle_seed_with_repulsion(
+    positions: np.ndarray,
+    ctx: "_RelaxContext",
+    edges: np.ndarray,
+    box: Union[float, Tuple[float, float, float], np.ndarray],
+    d0: float,
+    *,
+    r_rep_frac: float = 0.95,
+    r_detect_frac: float = 1.6,
+    lambda0: float = 4.0,
+    lambda_end_frac: float = 0.3,
+    n_stages: int = 8,
+    inner_iter: int = 40,
+    final_pure_iters: int = 0,
+    target_min_nb_frac: float = 0.6,
+    max_corrections: int = 3,
+    verbose: bool = False,
+) -> Tuple[np.ndarray, Dict]:
+    """Initial seed settle under Sellers Eq. 2 PLUS a decaying soft-sphere
+    repulsion, annealed to zero.
+
+    A pure repulsion-free relax of a random seed contracts every bond toward
+    ``d0``; at scale (random degree-3 at this density wants mean bond ~1.3 d0,
+    ~25% of bonds >1.5 d0) that contraction drags endpoints through neighbours
+    and collapses dense regions (the ``min_non_bonded < 0.4*d0`` hard fail).
+    Pre-spreading alone does not help -- the subsequent pure relax simply
+    undoes it. The robust fix is to keep a non-bonded repulsion *inside* the
+    settle and anneal it to zero, so the contraction reaches ``d0`` from a
+    well-spaced basin rather than crushing coincidences. This mirrors the
+    repulsive equilibration Sellers's own cited random-seed refs (Vink 2001;
+    Mousseau-Barkema 2001) apply before WWW; the **WWW anneal still sees the
+    pure Eq. 2 functional**, so emergent properties remain WWW-driven.
+
+    Requires the JAX backend (``ctx.use_jax``) for the analytic Sellers
+    gradient; callers fall back to ``soft_start_seed_relax`` + plain relax on
+    the NumPy path.
+
+    Schedule: ``n_stages`` L-BFGS solves with the repulsion weight ramped
+    linearly ``lambda0 -> 0``; the non-bonded pair list is rebuilt each stage
+    (so newly-closing pairs are caught) but frozen within a stage (smooth
+    objective). A final ``final_pure_iters`` pure-Eq.2 polish (weight exactly
+    0) lands the seed on a genuine Sellers minimum.
+
+    Returns ``(positions, info)`` with ``info`` reporting min non-bonded
+    separation before/after and final max bond length.
+    """
+    box_arr = coerce_box(box)
+    N = positions.shape[0]
+    # Activation floor (push apart below this) vs detection radius (track all
+    # near pairs, so one frozen per-stage list still catches a pair that
+    # collapses *during* a solve -- the failure mode of a tight-radius list).
+    r_rep = float(r_rep_frac) * float(d0)
+    r_detect = float(r_detect_frac) * float(d0)
+    e0 = edges[:, 0].astype(np.int64)
+    e1 = edges[:, 1].astype(np.int64)
+    edge_set = {(int(a), int(b)) if a < b else (int(b), int(a)) for a, b in edges}
+
+    def _tree(p):
+        shift = np.clip(p + box_arr / 2.0, 0.0, box_arr - 1e-12)
+        return cKDTree(shift, boxsize=box_arr)
+
+    def _rep_pairs(p):
+        cand = _tree(p).query_pairs(r=r_detect, output_type="ndarray")
+        if cand.size == 0:
+            return np.empty((0, 2), dtype=np.int64)
+        cand = np.sort(cand, axis=1)
+        keep = np.array([(int(a), int(b)) not in edge_set for a, b in cand])
+        return cand[keep]
+
+    def _min_non_bonded(p):
+        tree = _tree(p)
+        for r_q in (0.7 * d0, 1.2 * d0, 2.0 * d0):
+            cand = tree.query_pairs(r=r_q, output_type="ndarray")
+            if cand.size == 0:
+                continue
+            cand = np.sort(cand, axis=1)
+            keep = np.array([(int(a), int(b)) not in edge_set for a, b in cand])
+            cand = cand[keep]
+            if cand.shape[0] == 0:
+                continue
+            dd = np.linalg.norm(
+                pbc_displacement(p[cand[:, 0]] - p[cand[:, 1]], box_arr), axis=1
+            )
+            return float(dd.min())
+        return float("inf")
+
+    def _bond_max(p):
+        return float(np.linalg.norm(
+            pbc_displacement(p[e1] - p[e0], box_arr), axis=1
+        ).max())
+
+    def _rep_energy_grad(x, rep, k):
+        """One-sided soft-sphere repulsion energy + flat gradient."""
+        if not rep.shape[0] or k == 0.0:
+            return 0.0, np.zeros_like(x)
+        p = x.reshape(N, 3)
+        g = np.zeros((N, 3), dtype=np.float64)
+        ra, rb = rep[:, 0], rep[:, 1]
+        rvec = pbc_displacement(p[rb] - p[ra], box_arr)
+        Lr = np.linalg.norm(rvec, axis=1)
+        overlap = r_rep - Lr
+        active = overlap > 0.0
+        if not np.any(active):
+            return 0.0, g.reshape(-1)
+        E = float(k * np.sum(overlap[active] ** 2))
+        Lrsafe = np.maximum(Lr, 1e-12)
+        gco = (-2.0 * k * overlap / Lrsafe)[:, None] * rvec
+        gco[~active] = 0.0
+        np.add.at(g, rb, gco)
+        np.add.at(g, ra, -gco)
+        return E, g.reshape(-1)
+
+    if not ctx.use_jax:
+        raise RuntimeError(
+            "settle_seed_with_repulsion requires the JAX backend for the "
+            "analytic Sellers gradient; use soft_start_seed_relax on NumPy."
+        )
+
+    min_nb_before = _min_non_bonded(positions)
+    x = positions.reshape(-1).astype(np.float64).copy()
+    lambda_end = lambda_end_frac * lambda0
+    target = target_min_nb_frac * d0
+
+    def _stage(xv, lam, maxit):
+        rep = _rep_pairs(xv.reshape(N, 3)) if lam > 0.0 else np.empty((0, 2), np.int64)
+
+        def _vg(xx, _rep=rep, _lam=lam):
+            Es, gs = ctx.value_and_grad(xx)
+            gs = np.asarray(gs, dtype=np.float64)
+            Er, gr = _rep_energy_grad(xx, _rep, _lam)
+            return float(Es) + Er, gs + gr
+
+        res = minimize(_vg, xv, jac=True, method="L-BFGS-B",
+                       options={"maxiter": maxit, "gtol": 1e-8})
+        xv = res.x
+        xv = (xv.reshape(N, 3)
+              - box_arr * np.round(xv.reshape(N, 3) / box_arr)).reshape(-1)
+        if verbose:
+            p = xv.reshape(N, 3)
+            print(
+                f"[settle-rep] lambda={lam:.2f}: "
+                f"min_nb={_min_non_bonded(p) / d0:.3f}d0 "
+                f"bond_max={_bond_max(p) / d0:.2f}d0 rep_pairs={rep.shape[0]}"
+            )
+        return xv
+
+    # Ramp the repulsion weight lambda0 -> lambda_end over n_stages (a small
+    # nonzero floor, NOT zero: a full pure-Eq.2 polish would re-contract the
+    # network to the collapse edge and erase the spacing the repulsion just
+    # bought). A brief lambda=0 polish then removes gross repulsion artifacts
+    # without crushing the margin.
+    for s in range(n_stages):
+        lam = lambda0 + (lambda_end - lambda0) * s / max(1, n_stages - 1)
+        x = _stage(x, lam, inner_iter)
+    if final_pure_iters > 0:
+        x = _stage(x, 0.0, final_pure_iters)
+
+    # Self-correct: if the worst pair is still below target, re-spread (the
+    # repulsion provably lifts min_nb) with a short ramp. Bounded.
+    corrections = 0
+    while _min_non_bonded(x.reshape(N, 3)) < target and corrections < max_corrections:
+        corrections += 1
+        if verbose:
+            print(f"[settle-rep] correction {corrections}: re-spreading "
+                  f"(min_nb below {target_min_nb_frac:.2f}*d0)")
+        for s in range(3):
+            lam = lambda0 * (1.0 - s / 3.0)
+            x = _stage(x, max(lam, lambda_end), inner_iter)
+
+    pos = x.reshape(N, 3)
+    info = {
+        "min_nb_before": float(min_nb_before),
+        "min_nb_after": float(_min_non_bonded(pos)),
+        "bond_max_after": float(_bond_max(pos)),
+        "n_stages": int(n_stages),
+        "corrections": int(corrections),
+    }
+    return pos, info
 
 
 def _poisson_disk_pbc(
@@ -3231,31 +3735,149 @@ def generate_lsu_network(
             f"{_format_cluster_diagnostics(diag_seed, edge_length)}"
         )
 
-    # Initial global relaxation to settle the seed bond-length and absorb
-    # any jitter (crystal_srs) or chord stragglers (random_bm2000).
-    init_ctx = _RelaxContext(N, box, edge_length, weights,
-                             use_jax=use_jax, use_jaxopt=use_jaxopt_eff)
-    init_ctx.update_topology(edges, neighbors)
-    positions, E0, _ = relax(positions, init_ctx, max_iter=relax_global_iters)
-    positions = positions - box * np.round(positions / box)
-    if verbose:
-        post_relax_lengths = np.linalg.norm(
-            pbc_displacement(positions[edges[:, 1]] - positions[edges[:, 0]], box),
+    # Long-bond guard + initial settle, packaged as a reusable closure so a
+    # collapsed random seed can be rebuilt (see the seed-increment fallback
+    # below). A raw random seed (random_bm2000) carries a broad bond-length
+    # tail (mean ~1.3 d0, a few bonds past 2 d0; intrinsic to degree-3 +
+    # girth-5 on Poisson points -- a crystal seed is monodisperse at ~1.0 d0).
+    # The Sellers Eq. 2 relax has no non-bonded repulsion, so contracting a
+    # long bond can drag its endpoints through a neighbour and collapse them.
+    # Pre-spread with a self-contained soft-sphere potential, then relax; if
+    # the relax still lands an at-risk pair, re-spread harder and retry.
+    def _soft_start_and_settle(pos, edges_l, neighbors_l):
+        ctx = _RelaxContext(N, box, edge_length, weights,
+                            use_jax=use_jax, use_jaxopt=use_jaxopt_eff)
+        ctx.update_topology(edges_l, neighbors_l)
+        bond_max = float(np.linalg.norm(
+            pbc_displacement(pos[edges_l[:, 1]] - pos[edges_l[:, 0]], box),
             axis=1,
-        )
-        print(f"[gen] initial relax: E={E0:.4g}, "
-              f"bond length mean={post_relax_lengths.mean():.3f} "
-              f"(target d0={edge_length})")
+        ).max())
+        # A long-bond tail (random_bm2000) needs the repulsion guard; a
+        # monodisperse crystal seed (bond_max ~1.0 d0) does not and takes the
+        # plain relax path.
+        needs_repulsion = bond_max > 1.5 * edge_length
+        if needs_repulsion and ctx.use_jax:
+            # Robust, size-scalable settle: Sellers Eq. 2 PLUS a decaying
+            # soft-sphere repulsion annealed to a small floor. A pure
+            # repulsion-free relax collapses large random seeds (the
+            # contraction itself is the hazard, and seed-side spreading is
+            # undone by it); keeping repulsion *inside* the settle and ramping
+            # it down reaches d0 without crushing coincidences. The WWW anneal
+            # still sees pure Eq. 2.
+            pos, srep = settle_seed_with_repulsion(
+                pos, ctx, edges_l, box, edge_length, verbose=verbose,
+            )
+            diag = cluster_diagnostics(
+                pos, edges_l, neighbors_l, box, edge_length
+            )
+            if verbose:
+                print(
+                    f"[gen] repulsion-settle: min_nb "
+                    f"{srep['min_nb_before'] / edge_length:.3f}d0 -> "
+                    f"{srep['min_nb_after'] / edge_length:.3f}d0, "
+                    f"bond_max {srep['bond_max_after'] / edge_length:.2f}d0, "
+                    f"corrections={srep['corrections']}; "
+                    f"{_format_cluster_diagnostics(diag, edge_length)}"
+                )
+            return pos, None, diag
+        # NumPy fallback (no JAX): soft-start spread then plain relax with a
+        # re-spread retry. Works for small N; large N needs the JAX path above.
+        if needs_repulsion:
+            pos, soft_info = soft_start_seed_relax(
+                pos, edges_l, box, edge_length, verbose=verbose,
+            )
+            if verbose:
+                print(
+                    f"[gen] soft-start seed spread: min_nb "
+                    f"{soft_info['min_nb_before'] / edge_length:.3f}d0 -> "
+                    f"{soft_info['min_nb_after'] / edge_length:.3f}d0, "
+                    f"bond_max {soft_info['bond_max_after'] / edge_length:.2f}d0, "
+                    f"{soft_info['outer_passes']} passes"
+                )
+        diag = None
+        E_final = None
+        max_init_attempts = 4
+        for _attempt in range(max_init_attempts):
+            pos, E_final, _ = relax(pos, ctx, max_iter=relax_global_iters)
+            pos = pos - box * np.round(pos / box)
+            diag = cluster_diagnostics(
+                pos, edges_l, neighbors_l, box, edge_length
+            )
+            if verbose:
+                prl = np.linalg.norm(
+                    pbc_displacement(
+                        pos[edges_l[:, 1]] - pos[edges_l[:, 0]], box
+                    ),
+                    axis=1,
+                )
+                print(
+                    f"[gen] initial relax (attempt {_attempt + 1}): "
+                    f"E={E_final:.4g}, bond length mean={prl.mean():.3f} "
+                    f"(target d0={edge_length}); "
+                    f"{_format_cluster_diagnostics(diag, edge_length)}"
+                )
+            if (
+                diag["min_non_bonded"] >= 0.6 * edge_length
+                or _attempt == max_init_attempts - 1
+            ):
+                break
+            if verbose:
+                print(
+                    f"[gen] initial relax landed min_nb="
+                    f"{diag['min_non_bonded'] / edge_length:.3f}d0 (< 0.6 d0); "
+                    f"re-spreading harder and retrying "
+                    f"({_attempt + 1}/{max_init_attempts - 1})"
+                )
+            pos, _ = soft_start_seed_relax(
+                pos, edges_l, box, edge_length,
+                r_rep_frac=0.95, k_rep=2.0 + _attempt,
+                n_outer=24, target_min_nb_frac=0.7, verbose=verbose,
+            )
+        return pos, E_final, diag
 
-    # Post-initial-relax cluster diagnostic + hard fail on collapsed pairs.
-    diag_initrelax = cluster_diagnostics(
-        positions, edges, neighbors, box, edge_length
+    positions, E0, diag_initrelax = _soft_start_and_settle(
+        positions, edges, neighbors
     )
-    if verbose:
-        print(
-            f"[gen] post-initial-relax cluster diag: "
-            f"{_format_cluster_diagnostics(diag_initrelax, edge_length)}"
+
+    # Seed-increment fallback (random_bm2000, NumPy path only): the rare
+    # residual collapse is a property of one specific seed's bond-length tail,
+    # not of the protocol. On the JAX path settle_seed_with_repulsion handles
+    # it directly, so this is skipped there -- otherwise a (systematic) large-N
+    # collapse would grind through several full seed rebuilds before raising.
+    # On the NumPy path (small N, no repulsion-settle) a fresh RNG resolves it
+    # while leaving the pure-Eq.2 relax/anneal untouched.
+    seed_attempt = 0
+    max_seed_attempts = 6
+    while (
+        seed_kind == "random_bm2000"
+        and not use_jax
+        and diag_initrelax["min_non_bonded"] < 0.4 * edge_length
+        and seed_attempt < max_seed_attempts
+    ):
+        seed_attempt += 1
+        rng = np.random.default_rng(int(seed) + 7919 * seed_attempt)
+        if verbose:
+            print(
+                f"[gen] initial relax collapsed (min_nb="
+                f"{diag_initrelax['min_non_bonded'] / edge_length:.3f}d0); "
+                f"rebuilding random seed "
+                f"(attempt {seed_attempt}/{max_seed_attempts})"
+            )
+        positions, edges, seed_meta = random_seed_network_bm2000(
+            N, box, edge_length, rng,
+            min_separation_frac=bm2000_min_separation_frac,
+            rc_start_frac=bm2000_rc_start_frac,
+            rc_grow_frac=bm2000_rc_grow_frac,
+            rc_max_frac=bm2000_rc_max_frac,
+            verbose=verbose,
         )
+        neighbors = build_neighbors(N, edges)
+        positions, E0, diag_initrelax = _soft_start_and_settle(
+            positions, edges, neighbors
+        )
+
+    # Hard fail only if the retries + seed rebuilds could not lift the worst
+    # pair out of the collapse zone.
     if diag_initrelax["min_non_bonded"] < 0.4 * edge_length:
         raise RuntimeError(
             f"generate_lsu_network: min non-bonded vertex distance "

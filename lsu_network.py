@@ -27,6 +27,7 @@ move, LSU statistic, output formatting) so they can be reused or replaced.
 from __future__ import annotations
 
 import math
+import os
 import time
 import warnings
 from itertools import permutations
@@ -642,16 +643,17 @@ def random_seed_network_bm2000(
             dists, idxs = tree.query(pos_shift_all[current], k=k_query)
             dists = np.atleast_1d(dists)
             idxs = np.atleast_1d(idxs)
-            nxt = -1
-            d_nxt = float("inf")
-            for d_ij, j in zip(dists, idxs):
-                j = int(j)
-                if j == current or visited[j]:
-                    continue
-                nxt = j
-                d_nxt = float(d_ij)
-                break
-            if nxt >= 0:
+            # unvisited candidates among the k nearest (tree.query returns them
+            # in ascending-distance order, so cand_uv[0] is the nearest).
+            cand_uv = [(float(d_ij), int(j)) for d_ij, j in zip(dists, idxs)
+                       if int(j) != current and not visited[int(j)]]
+            if cand_uv:
+                if _RANDOM_SEED_CONSTRUCT:
+                    # BM2000-faithful: RANDOM among nearby unvisited (kept within
+                    # the k nearest so edges stay local/bounded), NOT greedy-nearest.
+                    d_nxt, nxt = cand_uv[int(rng.integers(0, len(cand_uv)))]
+                else:
+                    d_nxt, nxt = cand_uv[0]  # greedy nearest (original)
                 break
             if k_query >= N:
                 raise RuntimeError(
@@ -709,10 +711,16 @@ def random_seed_network_bm2000(
             is_d2 = deg < 3
             cand = cand[is_d2[cand[:, 0]] & is_d2[cand[:, 1]]]
         if cand.size:
-            dvec = pbc_displacement(
-                positions[cand[:, 0]] - positions[cand[:, 1]], box_arr
-            )
-            order = np.argsort(np.linalg.norm(dvec, axis=1))
+            if _RANDOM_SEED_CONSTRUCT:
+                # BM2000-faithful: RANDOM order among the in-rc candidate pairs
+                # (still bounded by rc, but not shortest-first which biases the
+                # seed's ring/topology spectrum toward spatial locality).
+                order = rng.permutation(cand.shape[0])
+            else:
+                dvec = pbc_displacement(
+                    positions[cand[:, 0]] - positions[cand[:, 1]], box_arr
+                )
+                order = np.argsort(np.linalg.norm(dvec, axis=1))
             for idx in order:
                 u = int(cand[idx, 0])
                 v = int(cand[idx, 1])
@@ -1537,6 +1545,26 @@ def build_dihedral_quads(edges: np.ndarray, neighbors: np.ndarray) -> np.ndarray
 # --------------------------------------------------------------------------- #
 _DIH_TARGET = 1.0 / 3.0  # |cos(70.53°)| = |cos(109.47°)| = 1/3
 
+# Use the literal length-coupled Keating forms for f1/f2:
+#   f1 = Σ(L²−d0²)²        (bond, vs the old simplified harmonic (L−d0)²)
+#   f2 = Σ(r_ij·r_ik + d0²/2)²   (angle, vs the old normalized (cosθ+1/2)²)
+# ADOPTED AS DEFAULT 2026-06-22: the old simplified forms made the energy
+# ~6-8x too angle-dominated (bonds too soft), so its minimum spread bonds and
+# lost the reference's hyperuniformity. The Keating forms (more faithful to
+# Sellers' "Keating energy-like", Supp Eq.2) make the reference a stable fixed
+# point of the anneal; f3/f4 are unchanged (faithful to Eq.3/4). Weights stay
+# fixed (0.7/0.7/0.3/0.4). Set LSU_KEATING_F1F2=0 to revert to the old forms
+# (regression/comparison only). See memory lsu-energy-keating-balance-fix.
+_KEATING_F1F2 = os.environ.get("LSU_KEATING_F1F2", "1") == "1"
+
+# EXPERIMENTAL (default OFF): BM2000-faithful RANDOM seed construction — random
+# cycle traversal + random in-rc pairing instead of greedy-nearest / shortest-
+# first selection (which inject the spatial-locality "crystallinity" bias that
+# BM2000 §II.A explicitly avoids: "absolutely no trace of crystallinity"). This
+# is a CONNECTIVITY change only; it does NOT alter Poisson-disk placement or the
+# seed's intrinsic vertex S(k0). Under multi-agent verification 2026-06-22.
+_RANDOM_SEED_CONSTRUCT = os.environ.get("LSU_RANDOM_SEED_CONSTRUCT", "0") == "1"
+
 
 def energy_components(
     positions: np.ndarray,
@@ -1554,7 +1582,6 @@ def energy_components(
     p_b = pos[edges[:, 1]]
     d_ab = pbc_displacement(p_b - p_a, box)
     L = np.linalg.norm(d_ab, axis=1)
-    f1 = np.sum((L - d0) ** 2)
 
     # --- f2: bond angles (target cos = -1/2) ------------------------------ #
     p_v = pos[triples[:, 0]]
@@ -1564,8 +1591,14 @@ def energy_components(
     e2 = pbc_displacement(p_n2 - p_v, box)
     n1 = np.linalg.norm(e1, axis=1)
     n2 = np.linalg.norm(e2, axis=1)
-    cos_t = np.einsum("ij,ij->i", e1, e2) / np.maximum(n1 * n2, 1e-12)
-    f2 = np.sum((cos_t + 0.5) ** 2)
+    if _KEATING_F1F2:
+        # literal length-coupled Keating forms
+        f1 = np.sum((L ** 2 - d0 ** 2) ** 2)
+        f2 = np.sum((np.einsum("ij,ij->i", e1, e2) + d0 ** 2 / 2) ** 2)
+    else:
+        f1 = np.sum((L - d0) ** 2)
+        cos_t = np.einsum("ij,ij->i", e1, e2) / np.maximum(n1 * n2, 1e-12)
+        f2 = np.sum((cos_t + 0.5) ** 2)
 
     # --- f3, f4: dihedrals + skew ----------------------------------------- #
     i, i1, i2, j, j1, j2 = (quads[:, k] for k in range(6))
@@ -1633,15 +1666,19 @@ if HAS_JAX:
         # f1: edge lengths
         d_ab = _pbc_jax(pos[edges[:, 1]] - pos[edges[:, 0]], box)
         L = jnp.linalg.norm(d_ab, axis=1)
-        f1 = jnp.sum((L - d0) ** 2)
 
         # f2: bond angles, target cos = -1/2
         e1 = _pbc_jax(pos[triples[:, 1]] - pos[triples[:, 0]], box)
         e2 = _pbc_jax(pos[triples[:, 2]] - pos[triples[:, 0]], box)
         n1 = jnp.linalg.norm(e1, axis=1)
         n2 = jnp.linalg.norm(e2, axis=1)
-        cos_t = jnp.sum(e1 * e2, axis=1) / jnp.maximum(n1 * n2, 1e-12)
-        f2 = jnp.sum((cos_t + 0.5) ** 2)
+        if _KEATING_F1F2:
+            f1 = jnp.sum((L ** 2 - d0 ** 2) ** 2)
+            f2 = jnp.sum((jnp.sum(e1 * e2, axis=1) + d0 ** 2 / 2) ** 2)
+        else:
+            f1 = jnp.sum((L - d0) ** 2)
+            cos_t = jnp.sum(e1 * e2, axis=1) / jnp.maximum(n1 * n2, 1e-12)
+            f2 = jnp.sum((cos_t + 0.5) ** 2)
 
         # f3, f4: dihedrals + skew
         i = quads[:, 0]; i1 = quads[:, 1]; i2 = quads[:, 2]

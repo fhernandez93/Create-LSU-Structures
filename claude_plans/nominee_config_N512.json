@@ -1,0 +1,22 @@
+{
+  "_comment": "VALIDATED recipe for N=512 random_bm2000 LSU network (2026-06-18), 3-seed confirmed (42/7/17) at 15k iters. PARTIAL success: passes void/hyperuniformity (S(k0) 0.036-0.12 all <0.15; S_low ~0.05-0.07) + ring-mean + amorphous; 6-ring ~3.3% (gate >=5%, intrinsic penalty<->6-ring tradeoff); bond std ~0.11 (gate <0.045, seed-conditioner floor). 40k single-seed longer variant (r10) nudges Phi_22 0.850->0.869, Phi_12=0.986 at 2.6x cost: Structures/20260618_r10_coldT_w30_40k.txt.",
+  "num_vertices": 512,
+  "bounds_microns": 9.152,
+  "edge_length": 0.8,
+  "seed_kind": "random_bm2000",
+  "seed": 42,
+  "lsu_degree_22": 0.889,
+  "initial_temperature": 0.045,
+  "final_temperature": 0.015,
+  "n_www_iterations": 15000,
+  "_n_www_iterations_longer_variant": 40000,
+  "uniformity_weight": 30.0,
+  "uniformity_kmax": 2,
+  "local_shell_depth": 4,
+  "relax_local_iters": 100,
+  "burn_in_n_heat": 0,
+  "burn_in_n_cool": 0,
+  "burn_in_n_quench": 0,
+  "energy_weights": {"alpha": 0.7, "beta": 0.7, "gamma": 0.3, "delta": 0.4},
+  "check_lsu_every": 0
+}

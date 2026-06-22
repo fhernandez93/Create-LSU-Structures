@@ -485,6 +485,7 @@ def random_seed_network_bm2000(
     long_bond_frac: float = 1.5,
     max_2opt_passes: int = 400,
     twoopt_k: int = 24,
+    seed_positions: Optional[np.ndarray] = None,
     verbose: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, Dict]:
     """Build a random Z=3 seed network via BM2000 (Phys. Rev. B 62, 4985) § II.A.
@@ -527,33 +528,43 @@ def random_seed_network_bm2000(
         )
     box_arr = coerce_box(box)
 
-    # --- Step 1: Poisson-disk placement ---------------------------------- #
-    placement_min_frac = float(min_separation_frac)
-    positions: Optional[np.ndarray] = None
-    while placement_min_frac >= 0.85:
-        positions = _poisson_disk_pbc(
-            N, box_arr, placement_min_frac * d0, rng,
-            max_tries=max(50_000, 200 * N),
-        )
-        if positions is not None:
-            break
+    # --- Step 1: vertex placement ---------------------------------------- #
+    if seed_positions is not None:
+        # Caller-supplied placement (e.g. hyperuniform_placement); skip the
+        # internal Poisson-disk sampler. Only the connectivity is built below.
+        positions = np.asarray(seed_positions, dtype=np.float64).reshape(N, 3)
+        positions = positions - box_arr * np.round(positions / box_arr)
+        placement_min_frac = float(min_separation_frac)
+        if verbose:
+            print(f"[bm2000 seed] using {N} caller-supplied vertex positions")
+    else:
+        # Poisson-disk placement (BM2000 §II.A hard-core random).
+        placement_min_frac = float(min_separation_frac)
+        positions: Optional[np.ndarray] = None
+        while placement_min_frac >= 0.85:
+            positions = _poisson_disk_pbc(
+                N, box_arr, placement_min_frac * d0, rng,
+                max_tries=max(50_000, 200 * N),
+            )
+            if positions is not None:
+                break
+            if verbose:
+                print(
+                    f"[bm2000 seed] placement at min_sep={placement_min_frac:.3f}*d0 "
+                    f"deadlocked; lowering by 0.02"
+                )
+            placement_min_frac -= 0.02
+        if positions is None:
+            raise RuntimeError(
+                f"random_seed_network_bm2000: could not place {N} vertices in "
+                f"box {box_arr.tolist()} even at min_separation 0.85*d0={0.85 * d0:.3g}. "
+                f"Lower N or enlarge the box."
+            )
         if verbose:
             print(
-                f"[bm2000 seed] placement at min_sep={placement_min_frac:.3f}*d0 "
-                f"deadlocked; lowering by 0.02"
+                f"[bm2000 seed] placed {N} vertices at "
+                f"min_sep={placement_min_frac:.3f}*d0"
             )
-        placement_min_frac -= 0.02
-    if positions is None:
-        raise RuntimeError(
-            f"random_seed_network_bm2000: could not place {N} vertices in "
-            f"box {box_arr.tolist()} even at min_separation 0.85*d0={0.85 * d0:.3g}. "
-            f"Lower N or enlarge the box."
-        )
-    if verbose:
-        print(
-            f"[bm2000 seed] placed {N} vertices at "
-            f"min_sep={placement_min_frac:.3f}*d0"
-        )
 
     # Wrap into canonical box (idempotent guard).
     positions = positions - box_arr * np.round(positions / box_arr)
@@ -1454,6 +1465,71 @@ def low_k_structure_factor(
     amp = np.exp(1j * phases).sum(axis=0)
     S = (np.abs(amp) ** 2) / max(1, pos.shape[0])
     return float(S.mean())
+
+
+def hyperuniform_placement(
+    N: int,
+    box: Union[float, Tuple[float, float, float], np.ndarray],
+    d0: float,
+    rng: np.random.Generator,
+    kmax: int = 3,
+    r_floor_frac: float = 0.85,
+    w_rep: float = 20.0,
+    maxiter: int = 400,
+    verbose: bool = False,
+) -> np.ndarray:
+    """Near-hyperuniform vertex placement (Hejna 2013 route Sellers cites).
+
+    The WWW anneal can HOLD a low S(k0) but cannot CREATE one (it is a local move
+    + a bonded energy with no long-wavelength term), so the reference's
+    hyperuniformity must be SUPPLIED by the seed's vertex placement. This is a
+    collective-coordinate ("stealthy") optimisation: minimise the low-k structure
+    factor S(k) for |k| below an integer-shell cutoff (`kmax`) plus a soft
+    hard-core penalty so points stay ~`r_floor_frac*d0` apart (so the seed
+    topology builder can still connect them). Returns positions in [-L/2, L/2]^3.
+    Requires JAX.
+    """
+    if not HAS_JAX:
+        raise RuntimeError("hyperuniform_placement requires JAX (use_jax=True).")
+    import jax
+    import jax.numpy as jnp
+    box_arr = coerce_box(box)
+    hkl = _low_k_hkl(kmax)                                   # (M,3) integer shells
+    kvec = jnp.asarray(2.0 * math.pi * (hkl / box_arr))      # reciprocal vectors
+    r_floor = r_floor_frac * d0
+    pos0 = _poisson_disk_pbc(N, box_arr, 0.9 * d0, rng,
+                             max_tries=max(50_000, 200 * N))
+    if pos0 is None:
+        pos0 = (rng.random((N, 3)) - 0.5) * box_arr
+    boxj = jnp.asarray(box_arr)
+
+    def energy(xf):
+        p = xf.reshape(N, 3)
+        # low-k structure factor S(k) = |sum_j e^{i k.r_j}|^2 / N (minimise)
+        rho = jnp.exp(1j * (p @ kvec.T)).sum(axis=0)
+        Sk = (jnp.abs(rho) ** 2).sum() / N
+        # soft hard-core (PBC) so points stay >~ r_floor apart
+        diff = p[:, None, :] - p[None, :, :]
+        diff = diff - boxj * jnp.round(diff / boxj)
+        r = jnp.sqrt((diff ** 2).sum(-1) + jnp.eye(N) * 1e6)
+        pen = (jnp.clip(r_floor - r, 0.0, None) ** 2).sum() * 0.5
+        return Sk + w_rep * pen
+
+    vg = jax.jit(jax.value_and_grad(energy))
+
+    def f(xf):
+        v, g = vg(jnp.asarray(xf))
+        return float(v), np.asarray(g, dtype=np.float64)
+
+    res = minimize(f, np.asarray(pos0, dtype=np.float64).ravel(), jac=True,
+                   method="L-BFGS-B", options={"maxiter": maxiter})
+    pos = res.x.reshape(N, 3)
+    pos = pos - box_arr * np.round(pos / box_arr)
+    if verbose:
+        print(f"[hyperuniform_placement] N={N} kmax={kmax} maxiter={maxiter}: "
+              f"S_k0={low_k_structure_factor(pos, box_arr, kmax=1):.4f} "
+              f"(converged={res.success})", flush=True)
+    return pos
 
 
 def _acceptance_objective(
@@ -3414,6 +3490,7 @@ def generate_lsu_network(
     bm2000_rc_start_frac: float = 1.30,
     bm2000_rc_grow_frac: float = 0.05,
     bm2000_rc_max_frac: float = 6.00,
+    hyperuniform_kmax: int = 3,
     burn_in_n_heat: int = 8_000,
     burn_in_n_cool: int = 16_000,
     burn_in_n_quench: int = 4_000,
@@ -3759,10 +3836,34 @@ def generate_lsu_network(
                   f"std={seed_lengths.std():.3f}, "
                   f"min={seed_lengths.min():.3f}, "
                   f"max={seed_lengths.max():.3f}")
+    elif seed_kind == "hyperuniform":
+        # Near-hyperuniform PLACEMENT (collective-coordinate low-k suppression,
+        # Hejna 2013) + the BM2000 connectivity builder on those points. The
+        # anneal HOLDS the supplied low S(k0) (needs the Keating f1/f2 energy,
+        # default) but does not create it. Pair with a uniformity_weight>0 to
+        # hold low-k through the topology annealing.
+        hp = hyperuniform_placement(
+            N, box, edge_length, rng, kmax=hyperuniform_kmax, verbose=verbose,
+        )
+        positions, edges, seed_meta = random_seed_network_bm2000(
+            N, box, edge_length, rng,
+            min_separation_frac=bm2000_min_separation_frac,
+            rc_start_frac=bm2000_rc_start_frac,
+            rc_grow_frac=bm2000_rc_grow_frac,
+            rc_max_frac=bm2000_rc_max_frac,
+            seed_positions=hp,
+            verbose=verbose,
+        )
+        neighbors = build_neighbors(N, edges)
+        if verbose:
+            print(f"[gen] hyperuniform seed: placement S_k0="
+                  f"{low_k_structure_factor(positions, box, kmax=1):.4f}, "
+                  f"rc_final={seed_meta['rc_final']:.3f}, "
+                  f"outer_passes={seed_meta['outer_passes']}")
     else:
         raise ValueError(
             f"unknown seed_kind={seed_kind!r}; expected "
-            f"'crystal_srs' or 'random_bm2000'."
+            f"'crystal_srs', 'random_bm2000', or 'hyperuniform'."
         )
 
     if verbose:

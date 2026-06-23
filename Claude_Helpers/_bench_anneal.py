@@ -7,10 +7,11 @@ import numpy as np
 import lsu_network as lsu
 from Claude_Helpers._anneal_device import www_anneal_device
 
-N = 1000; D0 = 0.8; BOX = 11.44
-box = np.array([BOX]*3, float); W = (0.7, 0.7, 0.3, 0.4)
 NMOVES = int(sys.argv[1]) if len(sys.argv) > 1 else 3000
 T = float(sys.argv[2]) if len(sys.argv) > 2 else 0.05
+N = int(sys.argv[3]) if len(sys.argv) > 3 else 1000
+D0 = 0.8; BOX = (N / 1000.0) ** (1.0 / 3.0) * 11.44
+box = np.array([BOX]*3, float); W = (0.7, 0.7, 0.3, 0.4)
 
 
 def fresh():

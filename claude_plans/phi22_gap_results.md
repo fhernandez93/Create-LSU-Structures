@@ -106,6 +106,23 @@ at the same iter, Φ22 ≥~0.87 en route to 0.88. **NO-GO** if E/atom rides syst
 under-relaxation compounds) → escalate to a jitted L-BFGS before shipping. Don't overwrite the deliverable /
 run #3/#1 / commit device code as working until GO. `fast=True` is parity-gated to N=1000+this schedule only.
 
+## ===== #2 RESULT (GO, committed 4fc5259) + #3 IN PROGRESS =====
+**#2 GO CONFIRMED.** Device mq2 replay (seed 42) tracked scipy within noise — E/atom AT-OR-BELOW scipy across
+ALL checkpoints (25k dev 0.083 vs 0.084; 100k 0.0515 vs 0.0516 identical; 150k 0.0438 vs 0.0452), Φ22/8r/angstd
+in-band or better. Pre-registered GO criteria met at 150k. The on-device BB anneal is correct + 3.4× faster.
+NOTABLE: the device path's raw S_k0 ran LOWER than scipy (device 0.02–0.04 at 100–150k vs scipy 0.08–0.18) —
+under investigation in #3 (does it mean the void emerges from the device anneal?). Notebook reproduces via
+`from_random_recipe.generate_from_random` (committed 2fa19b5). #1 runner ready (`_run_fromrandom_device.py`,
+N-parametrized; re-check parity at N=4000 before trusting fast path).
+**#3 RESULT (bounded NEGATIVE, as advisor predicted).** Long device probe (cool 0.09→0.04 + hold T=0.04, to
+250k of the planned 1M). (a) **8r plateaus ~50** (bounces 48–52 in the hold; gold 60 is the high tail —
+fluctuations to ~55 already captured by the deliverable). (b) **VOID does NOT emerge from pure WWW**, even
+though the device path's single-mode S_k0 dips low (0.038): the BROAD void gates FAIL — ext1 ck250k (no
+Stage-B) **S_low_k2 0.136 (gate 0.06), α +0.65 (gate 1.0)**. So the low S_k0 was the noisy single-shell measure
+(the same trap the cross-review flagged before); Stage-B / the explicit low-k objective remains REQUIRED. The
+prior "S(k) needs the low-k objective" finding STANDS for both scipy and device paths. Concluded (the T=0.04
+equilibrium is set; more hold won't change it) → GPU freed for #1.
+
 ## ===== OPTION 2 (user chose it): extended anneal — PROFILE REDIRECTS the fix =====
 Profiled per-move cost on GPU (`_profile_move.py`, cProfile, 2000 moves). **The bottleneck is NOT compute —
 it is host↔device TRANSFER overhead:** self-time `jax array._value` (device→host pulls) = 79s/206s (**38%**),

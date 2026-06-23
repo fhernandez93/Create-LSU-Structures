@@ -55,6 +55,18 @@ needs the low-k objective" STANDS. (3) **Single seed/run** — NOT the prompt's 
 **Honest net:** the local-order plateau is genuinely broken by pure WWW from random; with the free void fix
 the structure clears all hard gates; gold ring-sharpness approached not reached; needs a 2nd seed.
 
+## ===== 2-SEED CONFIRMATION (seed 7) — core result reproduces =====
+Ran the full slow-cool recipe on seed 7 (`mq2s7`, 0.09→0.028/250k). Seed 7 tracks seed 42 almost exactly on
+the robust metrics through the whole anneal: at 150k Φ22 **0.8700** (seed 42: 0.8699), at 175k Φ22 0.8761
+(seed 42: 0.8759), E/atom matched throughout. Final (250k): Φ22 0.881, angstd 9.16, 8r 51.2, 7r 12.3, mean 8.02.
+**CORE RESULT 2-SEED CONFIRMED:** extended pure-WWW from a random seed clears the local-order plateau
+(Φ22 0.844→0.88, angstd 11.6→~9.2) on BOTH seeds. NUANCE [honest]: seed 7's freeze settles angstd ~9.16–9.3
+(a sustained T=0.04 hold only nudged it 9.55→9.28) — marginally OVER the ≤9 gate, vs seed 42's 8.58. So:
+**1 clean all-gates PASS (seed 42) + 1 plateau-cleared-but-angstd-marginal (seed 7)** = run-to-run freeze
+variation (seed 7's topology carries slightly more angular strain), NOT a failure of the method. Also confirms
+seed 42's 8r-57 was a favourable FLUCTUATION (seed 7 typical 8r ~48–51; both seeds' equilibrium ~50). The
+8r 57 / 55.7 high-tail values are not the deterministic from-random ring count (~50 is).
+
 ## ===== REFINEMENT (sustain40): sustained T=0.04 hold improves the deliverable to 8r 55.7 =====
 mq2's rings PEAKED at 175k (8r 57, T≈0.04) then COARSENED on further cooling (8r→45, 9r→30) — cooling below
 ~0.04 coarsens 8r→9r. So a **sustained hold at T=0.04** (continue pure WWW from the 175k checkpoint, w=0,
@@ -79,6 +91,20 @@ patent and OVERTURNING the earlier "S(k) needs a hyperuniform seed/penalty" find
 mq2 freezes short (~8r 47) only because cooling pulls it out of the productive window before full ordering —
 the per-move transfer bottleneck caps the move budget. **This is the answer to the user: the random route
 DOES work and demonstrably converges; reaching 8r 60 needs the move budget the on-device speedup would unlock.**
+
+## ===== #2 ON-DEVICE SPEEDUP (BB relax) — benchmark + pre-registered parity gate =====
+Profile bottleneck = host↔device transfer (~189 round-trips/move). Fix: on-device anneal
+(`_anneal_device.py`), per-move relax = masked **Barzilai-Borwein GD** in ONE jitted `lax.fori_loop`,
+positions stay on-device. BB chosen over Adam (Adam under-relaxes mean dE +0.33; **BB matches scipy
+L-BFGS, mean dE +0.014**, frozen atoms fixed). **Benchmark (3k moves, T=0.05): 3.4× faster** (device 21
+vs scipy 72 ms/move; E/atom comparable). 3.4× (not 10×) because the per-move numpy topology rebuild
+(`build_dihedral_quads`) is now the floor — incremental topology update could push further (deferred).
+**GO/NO-GO (pre-registered, advisor):** judge the BAND/shape not point-for-point (dropping the Vink
+early-reject → chaotic trajectory divergence even if correct). Device path mq2 replay (`_run_meltquench_device
+mqd ...seed 42`) is **GO** only if by ~150–175k: 8r climbing past ~48, E/atom within ~0.003–0.005 of scipy's
+at the same iter, Φ22 ≥~0.87 en route to 0.88. **NO-GO** if E/atom rides systematically high (BB
+under-relaxation compounds) → escalate to a jitted L-BFGS before shipping. Don't overwrite the deliverable /
+run #3/#1 / commit device code as working until GO. `fast=True` is parity-gated to N=1000+this schedule only.
 
 ## ===== OPTION 2 (user chose it): extended anneal — PROFILE REDIRECTS the fix =====
 Profiled per-move cost on GPU (`_profile_move.py`, cProfile, 2000 moves). **The bottleneck is NOT compute —

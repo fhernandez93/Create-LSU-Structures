@@ -55,6 +55,15 @@ needs the low-k objective" STANDS. (3) **Single seed/run** — NOT the prompt's 
 **Honest net:** the local-order plateau is genuinely broken by pure WWW from random; with the free void fix
 the structure clears all hard gates; gold ring-sharpness approached not reached; needs a 2nd seed.
 
+## ===== REFINEMENT (sustain40): sustained T=0.04 hold improves the deliverable to 8r 55.7 =====
+mq2's rings PEAKED at 175k (8r 57, T≈0.04) then COARSENED on further cooling (8r→45, 9r→30) — cooling below
+~0.04 coarsens 8r→9r. So a **sustained hold at T=0.04** (continue pure WWW from the 175k checkpoint, w=0,
+`_run_holdtest.py sustain40 0.04 <ck175k> 200000 25000 42`) instead of cooling through it: settles bond angles
+to **angstd 8.41° (= ref)** and Φ22 0.884, with 8r equilibrating ~52 (best fluctuation 55.7 @50k). **The
+deliverable was UPDATED to sustain40@50k + Stage-B:** 8r **55.7** (was 47), 7r 11.4, angstd 8.58, Φ22 0.883,
+S_k0 0.022, mean 8.10 — near-reference on EVERY metric incl. the secondary 8r. 8r 60 is the T=0.04
+equilibrium's high tail (not its mean); a slightly colder sweet-spot T or far more moves may land it cleanly.
+
 ## ★★★ KEY RESULT (2026-06-23): MONOTONIC CONVERGENCE toward the reference with more annealing ★★★
 Three runs of INCREASING annealing all converge the SAME direction → strong evidence the random route is
 genuinely reachable (compute-limited, not walled):

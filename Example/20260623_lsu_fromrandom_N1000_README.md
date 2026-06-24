@@ -8,7 +8,8 @@ reaches reference-level Φ22 (0.844→0.881) and bond-angle std (11.6°→8.74°
 anneals were stuck at Φ22 ~0.84 / angstd ~11–12°. That gap was UNDER-ANNEALING, not a wall. **What it does
 NOT do:** match the gold ring sharpness (8r ~56 vs 60 — secondary metric) and it does NOT make the void
 hyperuniform *from the anneal* (see step 3 — the void needs the explicit low-k objective; it is added free
-post-hoc). Single seed/run.
+post-hoc). **2-SEED confirmed** (core plateau-clearing reproduces on seeds 42 AND 7; this deliverable is
+seed 42 — seed 7 clears the plateau too but its freeze lands angstd ~9.2, marginally over the ≤9 gate).
 
 Format: tab-delimited rod endpoints, PBC-duplicated face-crossing rods (same convention as
 `lsu_example_ends.txt`). Do NOT confuse with the gold `lsu_example_ends.txt` (untouched).

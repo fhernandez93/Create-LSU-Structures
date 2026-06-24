@@ -106,6 +106,15 @@ at the same iter, Φ22 ≥~0.87 en route to 0.88. **NO-GO** if E/atom rides syst
 under-relaxation compounds) → escalate to a jitted L-BFGS before shipping. Don't overwrite the deliverable /
 run #3/#1 / commit device code as working until GO. `fast=True` is parity-gated to N=1000+this schedule only.
 
+## ===== #1 N=4000 ESCALATION (running) — the speedup pays off 75× at scale =====
+N=4000 check (`_check_n4000.py`, device vs scipy): **device 45.9 ms/move vs scipy 3455 ms/move = 75× speedup**
+(scipy's per-move full-N grad transfer explodes with N; the device relax stays on-device on the local cluster).
+**scipy N=4000 ≈ 48 DAYS; device makes it ~15h** — the on-device work is what makes N=4000 feasible at all.
+E/atom parity holds (device 0.298 ≤ scipy 0.315 → BB not under-relaxing at N=4000) → fast=True valid at N=4000.
+**Running (user-approved):** `_run_fromrandom_device 4000 frd4000 0.09 0.040 700000 500000 50000 42` = cool
+0.09→0.04 (×700k) + hold T=0.04 (×500k) = 1.2M moves (300/atom), checkpointed /50k. Tests whether the
+from-random recipe clears the plateau (Φ22→0.88, angstd→~9, 8r→~50) at 4× scale → then Stage-B + validate gates.
+
 ## ===== #2 RESULT (GO, committed 4fc5259) + #3 IN PROGRESS =====
 **#2 GO CONFIRMED.** Device mq2 replay (seed 42) tracked scipy within noise — E/atom AT-OR-BELOW scipy across
 ALL checkpoints (25k dev 0.083 vs 0.084; 100k 0.0515 vs 0.0516 identical; 150k 0.0438 vs 0.0452), Φ22/8r/angstd

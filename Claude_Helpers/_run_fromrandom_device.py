@@ -39,11 +39,28 @@ T_full = np.concatenate([T_cool, np.full(n_hold, t_hold)])
 print(f"=== FROM-RANDOM DEVICE  N={N} box={BOX:.3f}  tag={tag} cool {t_hot}->{t_hold}x{n_cool} "
       f"+ hold x{n_hold} = {n_total} ({n_total/N:.0f}/atom)  seed={SEED} ===", flush=True)
 
-rng = np.random.default_rng(SEED)
-pos, edges, _ = lsu.random_seed_network_bm2000(N, box, D0, rng, verbose=False)
-neighbors = lsu.build_neighbors(N, edges)
-ctx0 = lsu._RelaxContext(N, box, D0, W, use_jax=True); ctx0.update_topology(edges, neighbors)
-pos, _ = lsu.settle_seed_with_repulsion(pos, ctx0, edges, box, D0, verbose=False)
+import glob, re, tools
+# --- AUTO-RESUME: continue from the latest saved checkpoint for this tag if any
+# (crash-robust: the device anneal can segfault at the CUDA level on long runs;
+# a restart-on-crash wrapper re-invokes this and we pick up where we left off) ---
+resume_iter = 0
+cks = glob.glob(f"Structures/*_{tag}_ck*k_edges.npy")
+if cks:
+    def _it(p):
+        m = re.search(r'_ck(\d+)k_edges', p); return int(m.group(1)) * 1000 if m else 0
+    latest = max(cks, key=_it); resume_iter = _it(latest)
+    rod = latest.replace('_edges.npy', '.txt')
+    rods0 = np.loadtxt(rod); pos, edges = tools.rods_to_network(rods0, box)
+    assert len(pos) == N, f"resume N mismatch {len(pos)} != {N}"
+    neighbors = lsu.build_neighbors(N, edges)
+    rng = np.random.default_rng(SEED + resume_iter)   # fresh stream from here
+    print(f"[{tag}] RESUMING from {latest} at iter {resume_iter}", flush=True)
+else:
+    rng = np.random.default_rng(SEED)
+    pos, edges, _ = lsu.random_seed_network_bm2000(N, box, D0, rng, verbose=False)
+    neighbors = lsu.build_neighbors(N, edges)
+    ctx0 = lsu._RelaxContext(N, box, D0, W, use_jax=True); ctx0.update_topology(edges, neighbors)
+    pos, _ = lsu.settle_seed_with_repulsion(pos, ctx0, edges, box, D0, verbose=False)
 
 
 def angstd(p, e):
@@ -68,9 +85,10 @@ def measure(pos, edges, label):
                 S_k0=float(sk0), r8=d.get(8,0), r7=d.get(7,0), mean=m, girth=girth)
 
 
-t0=time.time(); done=0
-m0=measure(pos,edges,"ck0")
-print(f"[{tag} ck=      0] SEED 8r={m0['r8']:.1f} S_k0={m0['S_k0']:.3f} Phi22={m0['phi22']:.4f}", flush=True)
+t0=time.time(); done=resume_iter
+if resume_iter == 0:
+    m0=measure(pos,edges,"ck0")
+    print(f"[{tag} ck=      0] SEED 8r={m0['r8']:.1f} S_k0={m0['S_k0']:.3f} Phi22={m0['phi22']:.4f}", flush=True)
 while done < n_total:
     n_this=min(chunk, n_total-done); Tslice=T_full[done:done+n_this]
     pos,edges,neighbors,hist = www_anneal_device(pos,edges,neighbors,box,D0,W,n_this,Tslice,rng,

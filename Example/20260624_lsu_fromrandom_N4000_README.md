@@ -31,6 +31,10 @@ checkpoint by the restart-on-crash wrapper; 0 further crashes.
 | 8-ring % (secondary) | 49.2 | 55.7 | 59.7 | →60 (track) |
 
 ## Reading (honest)
+- **Harness verified at N=4000.** The box derivation and `compute_lsu` subsampling are new (N=4000-untested)
+  code paths in the gate *reader*; they are trustworthy here because the validator's λ=0 baseline (Φ22 0.879,
+  ring-mean 7.98, angstd 9.08) matches the run's own inline graph-true measure at 1.2M — the reader was
+  cross-checked, not just the structure.
 - **The recipe SCALES.** Through the whole anneal, N=4000 tracked N=1000 at the *same moves/atom* almost
   exactly (e.g. at 125/atom: Φ22 0.865 vs 0.866, angstd 9.8 vs 9.5, 8r 46 vs 47; at the end: ring-mean 7.98 vs
   7.99). The void/amorphous/bond/ring-mean gates PASS (void via Stage-B). This is the finite-size positive.

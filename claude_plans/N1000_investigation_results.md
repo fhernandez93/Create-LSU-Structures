@@ -378,4 +378,4 @@ schedule, system size N≫1000.
   probew0_s42_ck*}.txt` (+ `.kwargs.json`). Logs: `claude_plans/log_{A1,probe_s42,S1,S1_s7}.txt`.
 - Harness: `Claude_Helpers/{_run_n1000.py, _run_sched.py, _probe_w0_checkpoints.py, _metrics.py
   (full_metrics_safe, collision-robust)}`.
-- Reviews: `claude_plans/agent_{stats,causal,fidelity}_review_N1000.md`.
+- Reviews: `claude_plans/archive/agent_{stats,causal,fidelity}_review_N1000.md`.

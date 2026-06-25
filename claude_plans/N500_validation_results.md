@@ -254,4 +254,4 @@ Metrics vs reference (✓/✗ against the prompt's N=512 criteria; r10=40k singl
 ### Files
 - Nominee network: `Structures/20260618_r10_coldT_w30_40k.txt` (+ all r* outputs in Structures/).
 - Harness: `_run_config.py`, `_metrics.py` (S(k₀) = mean over lowest |k| shell).
-- Agent reviews: `claude_plans/agent_stats_review.md`, `agent_causal_review.md`, `agent_fidelity_review.md`.
+- Agent reviews: `claude_plans/archive/agent_stats_review.md`, `archive/agent_causal_review.md`, `archive/agent_fidelity_review.md`.

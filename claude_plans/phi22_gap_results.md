@@ -106,7 +106,19 @@ at the same iter, Φ22 ≥~0.87 en route to 0.88. **NO-GO** if E/atom rides syst
 under-relaxation compounds) → escalate to a jitted L-BFGS before shipping. Don't overwrite the deliverable /
 run #3/#1 / commit device code as working until GO. `fast=True` is parity-gated to N=1000+this schedule only.
 
-## ===== #1 N=4000 ESCALATION (running) — the speedup pays off 75× at scale =====
+## ✅ #1 N=4000 RESULT: the recipe SCALES (reproduces N=1000 per-atom)
+N=4000 (box 18.16, 300 moves/atom = 1.2M, on-device, 0 restarts after one auto-recovered segfault at 250k)
+**reproduces the N=1000 from-random result on the IDENTICAL per-atom trajectory.** Validated (harness
+cross-checked: validator λ=0 baseline = the run's inline measure ✓): **Φ22 0.879, angstd 9.09, S_k0 0.021,
+S_low 0.010, α +2.19, amorphous svpk 1.60, bond-std 0.032, min_nb 0.449, ring-mean 7.98/girth 6, 8r 49.2.**
+Void/amorphous/bond/ring-mean gates PASS (void via Stage-B λ=1.0); **Φ22 (0.879) and angstd (9.09) land right
+AT the gates — exactly as the N=1000 freeze did (seed 7 also ~9.1)** — natural endpoint, NOT tuned under 9.
+Per-atom tracking was near-exact throughout (125/atom: Φ22 0.865 vs N=1000's 0.866, angstd 9.8 vs 9.5; end:
+ring-mean 7.98 vs 7.99). 8r 49 < gold 60 (secondary; the ~50 equilibrium, both scales). Saved
+`Example/20260624_lsu_fromrandom_N4000_ends.txt` (+README). **Finite-size positive: the from-random recipe
+reproduces at 4× scale.** The on-device speedup (75× at N=4000) is what made it feasible (scipy ≈ 48 days).
+
+## ===== #1 N=4000 ESCALATION (was running) — the speedup pays off 75× at scale =====
 N=4000 check (`_check_n4000.py`, device vs scipy): **device 45.9 ms/move vs scipy 3455 ms/move = 75× speedup**
 (scipy's per-move full-N grad transfer explodes with N; the device relax stays on-device on the local cluster).
 **scipy N=4000 ≈ 48 DAYS; device makes it ~15h** — the on-device work is what makes N=4000 feasible at all.

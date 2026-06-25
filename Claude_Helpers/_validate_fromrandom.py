@@ -14,7 +14,8 @@ import tools, lsu_network as lsu
 from Claude_Helpers._graph_rings import ring_stats_from_edges
 from Claude_Helpers._metrics import full_metrics_safe, s_k0
 
-BOX = 11.44; D0 = 0.8; box = np.array([BOX]*3, float); W = (0.7, 0.7, 0.3, 0.4); N = 1000
+N = int(os.environ.get("N_VAL", "1000"))
+BOX = (N/1000.0)**(1.0/3.0) * 11.44; D0 = 0.8; box = np.array([BOX]*3, float); W = (0.7, 0.7, 0.3, 0.4)
 KMAX = 2
 PATH = sys.argv[1]
 OUT_TAG = sys.argv[2] if len(sys.argv) > 2 else None
@@ -57,8 +58,9 @@ def measure(p, tag):
     p = p - box*np.round(p/box)
     d,m,c,g = ring_stats_from_edges(edges_g, N)
     astd = angstd(p, edges)
-    phi22 = float(lsu.compute_lsu(p, edges, nb, box, depth=2, locality=2))
-    phi12 = float(lsu.compute_lsu(p, edges, nb, box, depth=1, locality=2))
+    mp = None if N <= 1500 else 6000
+    phi22 = float(lsu.compute_lsu(p, edges, nb, box, depth=2, locality=2, max_pairs=mp, rng=np.random.default_rng(0)))
+    phi12 = float(lsu.compute_lsu(p, edges, nb, box, depth=1, locality=2, max_pairs=mp, rng=np.random.default_rng(0)))
     sk0,_,_ = s_k0(p, box); slow = float(lsu.low_k_structure_factor(p, box, kmax=KMAX))
     rods_o = lsu.network_to_rods(p, edges, box, pbc_duplicate_boundary_rods=True, clip_endpoints_to_box=False)
     out = f"Structures/_valfr_{tag}.txt"; np.savetxt(out, rods_o, fmt="%.6f", delimiter="\t")

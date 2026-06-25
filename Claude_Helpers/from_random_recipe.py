@@ -150,6 +150,14 @@ def generate_from_random(N=1000, seed=42, t_hot=0.09, t_cold=0.028, n_cool=25000
     Checkpoints are written as <date>_<tag>_ck<k>k.txt (+ _edges.npy) -- the same
     format assess_statistics / _validate_fromrandom read, so you can validate any
     intermediate state. Checkpointing does NOT change the final result.
+    Returns: 
+    - pos — vertex (node) coordinates. Shape (N, dims), which is why N = len(pos). These are the physical positions of the network's atoms/nodes in the box. _save_checkpoint deep-relaxes them
+        under the Keating potential (lsu.relax), wraps them back into the box (p2 - box*round(p2/box)), and writes them out.
+    - edges — the bond list / connectivity. An array of vertex-index pairs (i, j) saying which nodes are bonded. It's pure topology (indices into pos), carrying no coordinates. It's used to
+        build the neighbor table (lsu.build_neighbors(N, edges)), to set the relax topology, and to convert the relaxed network into rods (lsu.network_to_rods(p2, edges, ...)). It's saved
+        alongside the rod file as _edges.npy.
+    - rods end to end point of the actual rods
+
     """
     box = np.array([(N / 1000 * 11.44 ** 3) ** (1 / 3)] * 3, float); D0 = 0.8
     W = (0.7, 0.7, 0.3, 0.4)
@@ -208,4 +216,4 @@ def generate_from_random(N=1000, seed=42, t_hot=0.09, t_cold=0.028, n_cool=25000
     rods = lsu.network_to_rods(pos, edges, box, pbc_duplicate_boundary_rods=True,
                                clip_endpoints_to_box=False)
     if verbose: print(f"[recipe] done: {len(rods)} rods, E={len(edges)} edges.", flush=True)
-    return rods
+    return rods, pos, edges

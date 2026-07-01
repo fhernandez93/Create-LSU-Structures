@@ -22,6 +22,8 @@ distributions, near‑hyperuniformity, amorphousness). See
 | `Claude_Helpers/` | 6 helper modules — the production recipe + validation (see below). |
 | `Create_LSU_Function.ipynb` | **Main notebook**: generate → save → assess statistics. |
 | `20250903_create_h5_from_ends.ipynb` | Export a rod file to `.h5` / `.vtk` for visualization. |
+| `Anisotropy_g_from_ends.ipynb` + `scattering_g.py` | **Scattering anisotropy factor $g(\lambda)$** of a network — single‑scattering, no FDTD. See [Scattering anisotropy factor g](#scattering-anisotropy-factor-g). |
+| `Investigation_g_Values/` | Full‑wave $n_\mathrm{eff}$ validation harness + notes for the $g$ work. |
 | `Example/` | The gold reference + dated deliverables (each with a README + metrics) + grouped checkpoints. |
 | `claude_plans/` | The investigation write‑ups (documentation only — see its README). |
 
@@ -303,3 +305,148 @@ The reference has period L = 11.44 µm, so the canonical box is `[-5.72, 5.72]³
 Visible coordinates extend to ~±6.48 µm because rods crossing a face have one endpoint
 outside. The "≈13 µm size" in the example caption refers to that visible bounding box,
 not the true period.
+
+---
+
+# Scattering anisotropy factor g
+
+`Anisotropy_g_from_ends.ipynb` (engine `scattering_g.py`) computes the **bulk single‑scattering
+anisotropy factor** `g = ⟨cosθ⟩` of **one or more** connected amorphous dielectric networks directly from
+their `*_ends.txt` rod files, given the index contrast (`n_rod`, `n_bg`) and rod radius. **No FDTD.**
+
+You give it **a list of `*_ends.txt` files** (the vertex count `N` is auto‑extracted from each filename by
+regex, `N(\d+)`) and a **sweep you choose** — a wavelength range (`LAM_RANGE`, µm) or a reduced‑frequency
+range (`NU_RANGE`, `ν = a/λ`) plus the number of points. The sweep is **always linearly spaced in frequency**
+`ν = a/λ` (a `λ`‑range input is converted to its frequency range first). Overlaying several `N` on one plot
+directly shows the finite‑size convergence: reliable points are drawn solid, finite‑size‑limited points as
+`×` (see the validity map).
+
+> **Scope, up front.** This notebook computes **`g` only** — reliably, and in a well‑defined window. It
+> **does not** compute the scattering / transport mean free paths `ℓ_s, ℓ_t`: those require a full‑wave
+> method (FDTD). See [What this notebook does NOT compute](#what-this-notebook-does-not-compute-and-how-to-get-it).
+
+## What it computes, and the physics
+
+A network of connected dielectric rods is a **continuous two‑phase medium**, not a gas of isolated
+particles, so the rigorous Born object is the **spectral density**
+`χ̃_V(q) = |FFT[ε(r) − ⟨ε⟩]|² · dx³/G³`  (Torquato two‑phase formalism; Debye–Bueche 1949). Subtracting
+`⟨ε⟩` removes the `q=0` coherent forward term **by construction**, leaving exactly the diffuse
+single‑scattering of the disorder. The single‑scattering phase function and anisotropy are
+
+```
+p(θ) ∝ χ̃_V(q) · F_pol(θ),     q = 2 k_eff sin(θ/2),     k_eff = k0 · Re[n_eff]
+F_pol(unpolarized) = (1 + cos²θ)/2      (vector‑EM dipole factor)
+g = ⟨cosθ⟩ = ∫ p cosθ sinθ dθ / ∫ p sinθ dθ
+```
+
+This is the **structure‑factor‑weighted single‑scattering `g`** — the continuous‑medium analog of Vynck
+*et al.* RMP 2023 Eq. 120 (equivalently their fluctuating‑permittivity Eqs. 82–83). Two consequences that
+define the method:
+
+- **`g` is independent of the contrast *magnitude*.** `Δε` cancels in the normalized phase function — so
+  `g` is robust to the exact index and its shape is faithful even at high contrast. The *only* way the
+  contrast enters `g` is the **Ewald‑sphere radius** `k_eff = k0·Re[n_eff]` (a theorem, not an
+  approximation: the beyond‑Born scalar local‑field / Clausius–Mossotti vertex cancels in the normalized
+  `g`, Vynck RMP Table I / Eqs. 55–79).
+- **The effective index `n_eff` is the Ewald lever, and it must be physical.** For this **connected, chunky**
+  high‑index skeleton (rods percolate in 3‑D → *"high‑index matrix"* topology) the physical `n_eff` sits at
+  the **Hashin–Shtrikman *upper* bound**, computed from the strong‑contrast (Torquato–Kim 2021) expansion
+  with the rod phase as reference, capped at `n_hi`. The **Wiener volume average `n_av` is *unphysical*** (it
+  lies *above* `n_hi` for an isotropic medium) — do **not** use it as the Ewald index. Full‑wave‑validated:
+  a coherent‑transmission DDA gives `Re n_eff = 1.53` vs strong‑contrast `1.55` at `n_rod = 2.93`, `λ = 6 µm`
+  (harness + `⟨P(z)⟩` profile in `Investigation_g_Values/`).
+
+## Validity map — READ THIS
+
+`g` is a *radiative‑transfer* object; it is meaningful only in the independent‑scattering (ISA) /
+weak‑scattering window. The notebook floors its sweep to that window.
+
+| regime | is `g` reliable? | why |
+|---|---|---|
+| **off‑gap, `k·ℓ_s ≫ 1`, `a/λ ≳ 0.25`** | **YES** — it *is* the transport anisotropy | ISA holds; normalized `g` is contrast‑robust; `ℓ_t = ℓ_s/(1−g)` valid **if** you supply a full‑wave `ℓ_s` |
+| **at the photonic gap** (`2k_eff ≈ q_FSDP`) | **NO** (not a transport `g`) | no diffusion — dependent/recurrent + Bragg backscattering dominate |
+| **long λ** (`a/λ ≲ 0.25`; `≲0.22` at N=4000) | **NO** (finite‑size) | the Ewald sphere spans `< ~5` q‑shells (`dq = 2π/L`); the persistent negative‑`g` tail is an **artifact** — physically `g → 0` (Rayleigh, `∝ k²`) |
+
+**Extending the long‑λ reach.** The reliable reach grows only as **`λ_reliable ∝ L ∝ N^(1/3)`** (N=1000 →
+`λ ≲ 7–8 µm`; N=4000 → `≲ 11–12 µm`; N=10000 → `≲ 15–16 µm`). Ensemble‑averaging several independent cells
+cuts low‑`q` *noise* but does **not** extend the reach (it doesn't change `dq`). This is the *one* place a
+bigger cell helps — in the converged window, size is already saturated.
+
+## What this notebook does NOT compute (and how to get it)
+
+`ℓ_s`, `ℓ_t`, the DOS/gap and localization are **band‑structure / multiple‑scattering** quantities. A
+single‑scattering / 2‑point effective‑medium expansion **cannot** produce the photonic **band‑gap
+resonance** (where `ℓ_s` is smallest) — the Born series does not converge there — and is not quantitative at
+this contrast for a connected network (Vynck RMP 2023 §V.A names the Sellers/LSU material explicitly). So:
+
+- **`ℓ_s` (scattering MFP):** the extinction of the **coherent** field. In FDTD: launch a plane wave, take the
+  **complex, transverse/ensemble‑averaged** field (average `E`, *then* `|·|` — never `|E|` first, or the
+  diffuse halo leaks in), and fit `|⟨E(z)⟩| ∝ exp(−z / 2ℓ_s)` (**amplitude** → the factor of 2). Tile the cell
+  deeper than a few `ℓ_s`; a shoulder shallower than ~1 e‑fold is a *resolution lower bound*, not a value.
+  **At the gap, relabel:** that decay is the **Bragg/evanescent penetration length `L_B`**, not a scattering
+  MFP.
+- **`ℓ_t` (transport MFP) — measure it *directly* (do not infer from `g`):** `ℓ_t = ℓ_s/(1−g)` is an *identity
+  within* radiative transfer, so it only re‑expresses `g` and cannot validate it. Instead, from FDTD:
+  **(1)** diffusivity test first — is total `T(L)` Ohmic (`∝ 1/L` → diffuse) or `∝ exp(−L/ξ)` (→ localized)?
+  **(2)** Ohm's‑law fit `T(L) ≃ (1+z₀)·ℓ_t/L` for `L ≫ ℓ_t`, extrapolation length `z₀ ≈ 3.25` (Haberko/Scheffold);
+  or time‑resolved `D → ℓ_t = 3D/v_E` with the **renormalized energy velocity `v_E ≪ c/n`** (using `c/n`
+  near the high‑index resonances *overestimates* `ℓ_t` — van Tiggelen). Then the **assumption‑free** check is
+  `g_transport = 1 − ℓ_s/ℓ_t_direct`, compared to this notebook's `g` (they agree in the ISA window; divergence
+  quantifies near‑field/recurrent‑scattering breakdown).
+- **Gap / DOS / localization:** compute the **DOS / complex band structure** (supercell plane‑wave, e.g. MPB —
+  the Scheffold‑group method). This is the *master key*: it locates the gap and separates "evanescent `L_B` at
+  the DOS minimum" from "genuine Ioffe–Regel `ℓ_s` at a band edge." Report `L_B`, DOS, and (if `T ∝ exp(−L/ξ)`)
+  the localization length `ξ` — **not** `ℓ_t` or `g` — inside the gap.
+
+## Engine (`scattering_g.py`) — key functions
+
+- `voxelize_network`, `create_permittivity_grid_penlike` — rods → periodic `ε` grid.
+- `spectral_density`, `indicator_spectral_density`, `variance_check` — `χ̃_V(q)` (field + indicator).
+- `g_isotropic`, `g_directional`, `g_orientation_avg`, `g_contrast_isotropic` — the anisotropy `g`.
+- `hs_bounds_n`, `strong_contrast_neff_network` — Hashin–Shtrikman bounds + the physical Ewald `n_eff`.
+- `strong_contrast_eps_eff` / `strong_contrast_ell_s*` — Torquato–Kim effective permittivity (*note:* the
+  strong‑contrast `ℓ_s` is **not** reliable at the gap — see the validity map; use FDTD).
+- `mie_qsca_g`, `g_rgd_sphere`, `dda_solve`, `dda_cross_sections_g` — validation anchors (Mie / Rayleigh‑Gans)
+  and the frequency‑domain DDA kernel.
+
+## References
+
+**Master reference (definitions, `ℓ_s`/`ℓ_t`/`g`, dependent scattering):**
+- K. Vynck, R. Pierrat, R. Carminati, L. Froufe‑Pérez, F. Scheffold, R. Sapienza, S. Vignolini, J. J. Sáenz,
+  *"Light in correlated disordered media,"* **Rev. Mod. Phys. 95, 045003 (2023)** (arXiv:2106.13892). `g`
+  Eqs. 43–44/120; `ℓ_s,ℓ_t` Eqs. 82–83/118–119; coherent field Sec. II.A; Ioffe–Regel §V.
+
+**Effective medium / spectral density:**
+- S. Torquato & J. Kim, *"Nonlocal effective electromagnetic wave characteristics…,"* **Phys. Rev. X 11,
+  021002 (2021)** (arXiv:2007.00701) — strong‑contrast expansion, effective index.
+- S. Torquato, *Random Heterogeneous Materials* (Springer, 2002) — spectral density, Hashin–Shtrikman bounds.
+
+**3D amorphous photonic networks — the closest precedent for `ℓ_s`, `ℓ_t`, `D`, DOS, gap, localization:**
+- K. Haberko, L. Froufe‑Pérez, F. Scheffold, *"Transition from light diffusion to localization in 3D amorphous
+  dielectric networks near the band edge,"* **Nat. Commun. 11, 4867 (2020)** (arXiv:1812.02095). *(n=3.6, φ=0.28;
+  Ohm's‑law `T(L)`, `z₀`; mobility edges; the direct analog of this material.)*
+- F. Scheffold, K. Haberko, S. Magkiriadou, L. Froufe‑Pérez, *"…Localization and Bandgap Regimes,"*
+  **Phys. Rev. Lett. 129, 157402 (2022)** (arXiv:2204.07774). *(`T₀ ≈ DOS`; gap‑vs‑diffuse separation.)*
+- L. Froufe‑Pérez, M. Engel, J. J. Sáenz, F. Scheffold, *"Band gap formation and Anderson localization…,"*
+  **PNAS 114, 9570 (2017)** (arXiv:1702.03883). *(2D transport phase diagram.)*
+- S. R. Sellers, W. Man, S. Sahba, M. Florescu, *"Local self‑uniformity in photonic networks,"*
+  **Nat. Commun. 8, 14439 (2017).** *(the LSU material generated by this repo.)*
+
+**Transport / coherent field / velocity / localization:**
+- P. Sheng, *Introduction to Wave Scattering, Localization and Mesoscopic Phenomena*, 2nd ed. (Springer, 2006).
+- M. van Albada, B. van Tiggelen, A. Lagendijk, A. Tip, *"Speed of propagation of classical waves…,"*
+  **PRL 66, 3132 (1991)** — energy velocity `v_E ≠ c/n`.
+- A. Yamilov, S. Skipetrov, … H. Cao, *"Anderson localization of electromagnetic waves in three dimensions,"*
+  **Nat. Phys. 19, 1308 (2023)** (arXiv:2203.02842) — random 3D dielectric does *not* localize ⇒ any
+  localization here is **gap‑assisted / band‑edge**.
+- L. Leseur, R. Pierrat, R. Carminati, *"High‑density hyperuniform materials can be transparent,"*
+  **Optica 3, 763 (2016)** — the (real) long‑λ transparency of near‑hyperuniform media.
+- L. F. Rojas‑Ochoa *et al.*, **PRL 93, 073903 (2004)** — negative `g` / `ℓ_t < ℓ_s` at the structure‑factor peak.
+
+## Run
+
+```bash
+conda activate lsu_project          # numpy / scipy / jax / h5py / matplotlib
+jupyter nbconvert --to notebook --execute Anisotropy_g_from_ends.ipynb   # or open in Jupyter
+# JAX_PLATFORMS=cpu … if the GPU is contended. Output: Structures/anisotropy_g_<tag>.h5
+```

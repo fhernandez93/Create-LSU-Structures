@@ -27,6 +27,7 @@ import tools
 import lsu_network as lsu
 from Claude_Helpers._graph_rings import ring_stats_from_edges
 from Claude_Helpers._metrics import full_metrics_safe, s_k0
+from Claude_Helpers.from_random_recipe import _rods_to_network_N
 
 KMAX = 2
 W = (0.7, 0.7, 0.3, 0.4)
@@ -59,16 +60,23 @@ def _gate(r):
 
 
 def _load(rods_or_path, box, N):
-    """Return (pos, edges, edges_graph). Prefer a sibling _edges.npy (graph-true,
-    collision-proof) when a path is given."""
+    """Return (pos, edges, edges_graph). Reconstruct a self-consistent (pos, edges)
+    pair from the rod geometry with `_rods_to_network_N`, which auto-shrinks the
+    merge radius if the default 0.1 um fuses a near-coincident *non-bonded* vertex
+    pair into a degree>3 node -- otherwise `build_neighbors` raises IndexError
+    (this is what bites at large N, where a rare pair of distinct junctions can
+    relax to within 0.1 um; e.g. an N=10000 network with two junctions ~0.087 um
+    apart). The near-coincidence is a real clumping signal and still surfaces via
+    `min_nb`. Prefer a sibling `_edges.npy` (graph-true topology) for ring stats
+    when a path is given."""
     if isinstance(rods_or_path, str):
         rods = np.loadtxt(rods_or_path)
-        pos, edges = tools.rods_to_network(rods, box)
+        pos, edges = _rods_to_network_N(rods, box, N)
         ep = rods_or_path.replace('.txt', '_edges.npy')
         edges_g = np.load(ep) if os.path.exists(ep) else edges
     else:
         rods = np.asarray(rods_or_path, float)
-        pos, edges = tools.rods_to_network(rods, box)
+        pos, edges = _rods_to_network_N(rods, box, N)
         edges_g = edges
     return pos, edges, edges_g
 

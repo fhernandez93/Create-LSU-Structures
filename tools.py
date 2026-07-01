@@ -96,6 +96,35 @@ def rods_to_network(
     return positions, edges
 
 
+def rods_to_network_degree3(
+    rods: np.ndarray, box: np.ndarray,
+    radii=(0.1, 0.04, 0.02, 0.01, 0.005, 0.002),
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """`rods_to_network` that retries with a tighter merge radius until every
+    vertex is degree 3 (i.e. `build_neighbors` succeeds). The default 0.1 µm
+    radius can fuse a near-coincident *non-bonded* junction pair into a degree>3
+    vertex, which crashes `build_neighbors`. This bites at large N, where two
+    distinct degree-3 junctions may relax to within 0.1 µm of each other (e.g. an
+    N=10000 network with two junctions ~0.087 µm apart). PBC-image duplicates sit
+    at PBC-distance ~0, so every radius in the ladder still merges them correctly;
+    only the genuine near-coincidence is spared. Returns (positions, edges,
+    neighbors, cluster_radius_used). Same guard as `_metrics.full_metrics_safe`
+    and `from_random_recipe._rods_to_network_N`; the near-coincidence is a real
+    clumping signal and still shows up in the min non-bonded separation."""
+    last_err = None
+    for cr in radii:
+        positions, edges = rods_to_network(rods, box, cluster_radius=cr)
+        try:
+            neighbors = build_neighbors(len(positions), edges)
+        except (IndexError, ValueError) as e:
+            last_err = e
+            continue
+        return positions, edges, neighbors, float(cr)
+    raise RuntimeError(
+        f"rods_to_network_degree3: no merge radius in {radii} yields an "
+        f"all-degree-3 graph (last error: {last_err})")
+
+
 def srs_crystal_rods(
     num_vertices: int = 1000,
     box: Union[float, np.ndarray] = 11.44,
@@ -401,9 +430,8 @@ def analyze_network(
     box_arr = np.asarray(box if hasattr(box, "__len__") else [box, box, box], dtype=float)
     L = float(box_arr[0])
 
-    positions, edges = rods_to_network(rods, box_arr)
+    positions, edges, neighbors, _ = rods_to_network_degree3(rods, box_arr)
     N = len(positions)
-    neighbors = build_neighbors(N, edges)
 
     bl = _bond_lengths(positions, edges, L)
     angles, planarities = _angle_and_planarity(positions, edges, L)

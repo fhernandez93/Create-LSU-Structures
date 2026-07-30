@@ -61,9 +61,8 @@ def full_metrics(rods_or_path, box, d0=0.8, label="net", cluster_radius=None):
 
     # min non-bonded vertex separation (PBC) — collision/clumping signal
     from scipy.spatial import cKDTree
-    L = float(box_arr[0])
-    wp = (positions + L / 2) % L
-    tree = cKDTree(wp, boxsize=L)
+    wp = (positions + box_arr / 2) % box_arr
+    tree = cKDTree(wp, boxsize=box_arr)
     dists, idxs = tree.query(wp, k=2)
     nn_d, nn_j = dists[:, 1], idxs[:, 1]
     bonded = set(map(tuple, (np.sort(edges, axis=1)).tolist()))
@@ -129,7 +128,7 @@ def print_metrics(r, ref=None):
 
 if __name__ == "__main__":
     import sys
-    ref = full_metrics("Example/lsu_example_ends.txt", box=11.44, d0=0.8, label="REFERENCE")
+    ref = full_metrics("Example/N1000_lsu_example_ends.txt", box=11.44, d0=0.8, label="REFERENCE")
     print_metrics(ref)
     for path in sys.argv[1:]:
         m = full_metrics(path, box=9.152, d0=0.8, label=path)

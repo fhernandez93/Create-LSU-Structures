@@ -51,8 +51,15 @@ def ring_stats_from_edges(edges, N):
 
 
 if __name__ == "__main__":
-    import sys, tools, lsu_network as lsu
-    box = np.array([11.44] * 3)
+    import os, sys, tools, lsu_network as lsu
+    # env BOX: "L" (cube) or "Lx,Ly,Lz" (slab); only used for .txt rod files,
+    # where the graph is reconstructed under PBC. .npy edge input is box-free.
+    _b = os.environ.get("BOX")
+    if _b:
+        _v = [float(x) for x in _b.replace(",", " ").split()]
+        box = np.array(_v * 3 if len(_v) == 1 else _v, float)
+    else:
+        box = np.array([11.44] * 3)
     path = sys.argv[1] if len(sys.argv) > 1 else "Example/lsu_example_ends.txt"
     if path.endswith(".npy"):
         edges = np.load(path); N = int(edges.max()) + 1

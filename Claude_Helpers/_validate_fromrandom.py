@@ -14,7 +14,7 @@ the best, and optionally saves it to Example/<out_tag>_ends.txt. This is the
 
 CLI (unchanged behaviour -- Stage-B sweep, save best if a tag is given):
   python -m Claude_Helpers._validate_fromrandom <ckpt_rodfile.txt> [out_tag]
-  env: N_VAL (1000)
+  env: N_VAL (1000), BOX ("L" cube or "Lx,Ly,Lz" slab; default density-matched cube)
 """
 import sys
 import os
@@ -93,7 +93,7 @@ def _measure(p, edges, edges_g, box, N, label):
     slow = float(lsu.low_k_structure_factor(p, box, kmax=KMAX))
     rods_o = lsu.network_to_rods(p, edges, box, pbc_duplicate_boundary_rods=True, clip_endpoints_to_box=False)
     try:
-        mm, _ = full_metrics_safe(rods_o, box=float(box[0]), d0=D0, label=label)
+        mm, _ = full_metrics_safe(rods_o, box=box, d0=D0, label=label)
         alpha = mm["S_v_alpha_low"]; svpk = mm["S_v_peak"]; bstd = mm["bond_len_std"]; minnb = mm["min_nb"]
     except RuntimeError:
         alpha = float('nan'); svpk = float('nan'); bstd = float('nan'); minnb = float('nan')
@@ -120,11 +120,18 @@ def _print_ref():
 
 
 def assess_statistics(rods_or_path, N=1000, stage_b=False, lambdas=(0.0, 1.0, 5.0, 20.0),
-                      out_tag=None, verbose=True):
+                      out_tag=None, verbose=True, bounds=None):
     """Measure all reproduction gates for a network and print PASS/FAIL vs the
     reference. Returns a metrics dict (the best Stage-B result when stage_b=True,
     else the deep-relaxed baseline). Pass a rod-endpoint array (e.g. straight from
     `generate_from_random`) or a path to a saved `_ends.txt` / checkpoint `.txt`.
+
+    bounds : None (default) -> the density-matched cube inferred from N (legacy).
+             For a network generated in an orthorhombic box you MUST pass its
+             (Lx, Ly, Lz) here (e.g. (100, 100, 20)) — with the wrong box every
+             PBC-based metric (Phi, S(k), rings via reconstruction) is garbage.
+             The reference gate values themselves stay meaningful: they are
+             intensive/dimensionless stats at the shared reference density.
 
     stage_b=False : just measure (deep-relax under Keating, then the gate set).
                     Use this on a finished network (the recipe already did Stage-B).
@@ -132,7 +139,7 @@ def assess_statistics(rods_or_path, N=1000, stage_b=False, lambdas=(0.0, 1.0, 5.
                     pick the best, and (if out_tag) save it to Example/<out_tag>_ends.txt.
                     Use this to validate a RAW (pre-void-fix) anneal checkpoint.
     """
-    box = _box_for(N)
+    box = _box_for(N) if bounds is None else lsu.coerce_box(bounds)
     pos, edges, edges_g = _load(rods_or_path, box, N)
     nb = lsu.build_neighbors(N, edges)
     ctx = lsu._RelaxContext(N, box, D0, W, use_jax=True, use_jaxopt=False)
@@ -189,7 +196,9 @@ def assess_statistics(rods_or_path, N=1000, stage_b=False, lambdas=(0.0, 1.0, 5.
 
 if __name__ == "__main__":
     N = int(os.environ.get("N_VAL", "1000"))
+    _b = os.environ.get("BOX")
+    bounds = [float(x) for x in _b.replace(",", " ").split()] if _b else None
     path = sys.argv[1]
     out_tag = sys.argv[2] if len(sys.argv) > 2 else None
-    print(f"=== VALIDATE from-random {path} (N={N}) ===", flush=True)
-    assess_statistics(path, N=N, stage_b=True, out_tag=out_tag, verbose=True)
+    print(f"=== VALIDATE from-random {path} (N={N}, box={bounds or 'density-matched cube'}) ===", flush=True)
+    assess_statistics(path, N=N, stage_b=True, out_tag=out_tag, verbose=True, bounds=bounds)

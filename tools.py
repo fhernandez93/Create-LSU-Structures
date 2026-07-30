@@ -57,6 +57,18 @@ from lsu_network import build_neighbors, cluster_diagnostics, compute_lsu, cryst
 # ----------------------------- graph reconstruction ------------------------ #
 
 
+def _coerce_box(box: Union[float, np.ndarray]) -> np.ndarray:
+    """Return a (3,) float box from a scalar (cubic) or length-3 (orthorhombic,
+    e.g. a 100x100x20 slab) side-length spec. All PBC arithmetic below
+    broadcasts per-axis, so a slab box is handled exactly like a cube."""
+    if not hasattr(box, "__len__"):
+        return np.array([box, box, box], dtype=float)
+    box_arr = np.asarray(box, dtype=float).reshape(-1)
+    if box_arr.size != 3:
+        raise ValueError(f"box must be scalar or length-3, got {box!r}")
+    return box_arr
+
+
 def rods_to_network(
     rods: np.ndarray, box: np.ndarray, cluster_radius: float = 0.1
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -66,11 +78,11 @@ def rods_to_network(
     `cluster_radius`) are merged into one vertex. PBC-image duplicates of
     face-crossing rods collapse to the same edge.
     """
-    L = float(box[0])
+    box_arr = _coerce_box(box)
     p1 = rods[:, :3]; p2 = rods[:, 3:]
     endpoints = np.vstack([p1, p2])
-    wrapped_pos = (endpoints - L * np.floor(endpoints / L + 0.5)) + L / 2
-    tree = cKDTree(wrapped_pos, boxsize=L)
+    wrapped_pos = (endpoints - box_arr * np.floor(endpoints / box_arr + 0.5)) + box_arr / 2
+    tree = cKDTree(wrapped_pos, boxsize=box_arr)
     pairs = tree.query_pairs(r=cluster_radius, output_type='ndarray')
     n = len(wrapped_pos)
     if len(pairs):
@@ -86,9 +98,9 @@ def rods_to_network(
         pts = wrapped_pos[members]
         anchor = pts[0]
         diffs = pts - anchor
-        diffs -= L * np.round(diffs / L)
+        diffs -= box_arr * np.round(diffs / box_arr)
         positions[cid] = anchor + diffs.mean(axis=0)
-    positions = ((positions + L / 2) % L) - L / 2
+    positions = ((positions + box_arr / 2) % box_arr) - box_arr / 2
     R = len(p1)
     edges_full = np.stack([labels[:R], labels[R:]], axis=1)
     edges = np.unique(np.sort(edges_full, axis=1), axis=0)
@@ -153,30 +165,29 @@ def srs_crystal_rods(
         RNG seed for jitter.
     """
     rng = np.random.default_rng(seed)
-    box_arr = np.asarray([box, box, box], dtype=float) if not hasattr(box, "__len__") else np.asarray(box, dtype=float)
+    box_arr = _coerce_box(box)
     positions, edges, _ = crystal_seed_network(
         N=num_vertices, box=box_arr, d0=d0, rng=rng,
         lattice="srs", jitter_sigma=float(jitter_sigma),
     )
-    L = float(box_arr[0])
     p1 = positions[edges[:, 0]]
     p2 = positions[edges[:, 1]]
     d = p2 - p1
-    d -= L * np.round(d / L)
+    d -= box_arr * np.round(d / box_arr)
     return np.hstack([p1, p1 + d])
 
 
 # ----------------------------- metric helpers ------------------------------ #
 
 
-def _bond_lengths(positions: np.ndarray, edges: np.ndarray, L: float) -> np.ndarray:
+def _bond_lengths(positions: np.ndarray, edges: np.ndarray, L: np.ndarray) -> np.ndarray:
     d = positions[edges[:, 1]] - positions[edges[:, 0]]
     d -= L * np.round(d / L)
     return np.linalg.norm(d, axis=1)
 
 
 def _angle_and_planarity(
-    positions: np.ndarray, edges: np.ndarray, L: float
+    positions: np.ndarray, edges: np.ndarray, L: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray]:
     N = len(positions)
     nbrs: List[List[int]] = [[] for _ in range(N)]
@@ -197,7 +208,7 @@ def _angle_and_planarity(
 
 
 def _skew_angles(
-    positions: np.ndarray, edges: np.ndarray, L: float
+    positions: np.ndarray, edges: np.ndarray, L: np.ndarray
 ) -> np.ndarray:
     """Trihedral skew angles χ in degrees (Sellers et al. 2017, Fig. 4d).
 
@@ -258,7 +269,7 @@ def _shortest_ring_per_edge(N: int, edges: np.ndarray) -> np.ndarray:
 
 
 def _dihedral_entropy(
-    positions: np.ndarray, edges: np.ndarray, L: float, nbins: int = 18
+    positions: np.ndarray, edges: np.ndarray, L: np.ndarray, nbins: int = 18
 ) -> Tuple[np.ndarray, float]:
     N = len(positions)
     nbrs: List[List[int]] = [[] for _ in range(N)]
@@ -300,8 +311,8 @@ def _dihedral_entropy(
 def _vertex_structure_factor(
     positions: np.ndarray, box: np.ndarray, k_modes_max: int = 8
 ) -> Tuple[np.ndarray, np.ndarray]:
-    L = float(box[0])
-    k0 = 2.0 * np.pi / L
+    box_arr = _coerce_box(box)
+    k0 = 2.0 * np.pi / box_arr  # per-axis reciprocal spacing (orthorhombic-safe)
     N = len(positions)
     hkl: List[Tuple[int, int, int]] = []
     for h in range(-k_modes_max, k_modes_max + 1):
@@ -312,10 +323,17 @@ def _vertex_structure_factor(
                 hkl.append((h, k, l))
     kvecs = np.asarray(hkl, dtype=np.float64) * k0
     kmag = np.linalg.norm(kvecs, axis=1)
-    phases = kvecs @ positions.T
-    re = np.cos(phases).sum(axis=1)
-    im = np.sin(phases).sum(axis=1)
-    return kmag, (re ** 2 + im ** 2) / N
+    # Chunk over k rows: a dense (M, N) phase matrix is O(M*N) memory — tens of
+    # GB for a density-matched 100x100x20 slab (N~134k). Rows are independent,
+    # so chunking is bitwise-identical to the one-shot product.
+    S = np.empty(len(kvecs))
+    chunk = max(1, int(2e7 // max(1, N)))
+    for i in range(0, len(kvecs), chunk):
+        phases = kvecs[i:i + chunk] @ positions.T
+        re = np.cos(phases).sum(axis=1)
+        im = np.sin(phases).sum(axis=1)
+        S[i:i + chunk] = (re ** 2 + im ** 2) / N
+    return kmag, S
 
 
 def _bin_structure_factor(
@@ -342,10 +360,19 @@ def _vertex_structure_factor_2d_slice(
     Returns (bin_centers_1d, grid_2d) with shape (nbins,) and (nbins, nbins).
     The grid is indexed as ``grid[iy, ix]`` so it can be passed directly to
     ``imshow`` with ``origin='lower', extent=(-kmax, kmax, -kmax, kmax)``.
-    Empty bins are 0.
+    Empty bins are 0. Binning is per-axis (k_x from L_x, k_y from L_y), so
+    an orthorhombic box is handled correctly; the returned 1D centers are the
+    k_x bins (== k_y whenever L_x == L_y, which plot_comparison assumes for
+    its square extent).
     """
-    L = float(box[0])
-    k0 = 2.0 * np.pi / L
+    box_arr = _coerce_box(box)
+    if box_arr[0] != box_arr[1]:
+        import warnings
+        warnings.warn(
+            f"_vertex_structure_factor_2d_slice: Lx={box_arr[0]} != Ly={box_arr[1]}; "
+            f"the returned 1D centers are the k_x bins, and plot_comparison's "
+            f"square extent will mislabel the k_y axis by Lx/Ly.", stacklevel=2)
+    k0 = 2.0 * np.pi / box_arr
     N = len(positions)
     if nbins is None:
         nbins = 2 * k_modes_max + 1  # one bin per integer-multiple of k0
@@ -357,13 +384,18 @@ def _vertex_structure_factor_2d_slice(
                     continue
                 hkl.append((h, k, l))
     kvecs = np.asarray(hkl, dtype=np.float64) * k0
-    phases = kvecs @ positions.T
-    S = (np.cos(phases).sum(axis=1) ** 2 + np.sin(phases).sum(axis=1) ** 2) / N
+    S = np.empty(len(kvecs))
+    chunk = max(1, int(2e7 // max(1, N)))  # bound the (chunk, N) phase matrix
+    for i in range(0, len(kvecs), chunk):
+        phases = kvecs[i:i + chunk] @ positions.T
+        S[i:i + chunk] = (np.cos(phases).sum(axis=1) ** 2
+                          + np.sin(phases).sum(axis=1) ** 2) / N
     edge_kmax = (k_modes_max + 0.5) * k0
-    edges = np.linspace(-edge_kmax, edge_kmax, nbins + 1)
-    centers = 0.5 * (edges[:-1] + edges[1:])
-    ix = np.clip(np.digitize(kvecs[:, 0], edges) - 1, 0, nbins - 1)
-    iy = np.clip(np.digitize(kvecs[:, 1], edges) - 1, 0, nbins - 1)
+    edges_x = np.linspace(-edge_kmax[0], edge_kmax[0], nbins + 1)
+    edges_y = np.linspace(-edge_kmax[1], edge_kmax[1], nbins + 1)
+    centers = 0.5 * (edges_x[:-1] + edges_x[1:])
+    ix = np.clip(np.digitize(kvecs[:, 0], edges_x) - 1, 0, nbins - 1)
+    iy = np.clip(np.digitize(kvecs[:, 1], edges_y) - 1, 0, nbins - 1)
     grid_sum = np.zeros((nbins, nbins))
     grid_cnt = np.zeros((nbins, nbins), dtype=int)
     np.add.at(grid_sum, (iy, ix), S)
@@ -403,8 +435,10 @@ def analyze_network(
         ``generate_lsu_network``) or a path to a file readable by
         ``np.loadtxt`` in the 6-column tab-separated format.
     box, d0
-        Box side length (µm) and target bond length (µm). Defaults match the
-        reference example.
+        Box side length(s) (µm) and target bond length (µm). ``box`` may be a
+        scalar (cubic) or a length-3 sequence ``(Lx, Ly, Lz)`` for an
+        orthorhombic box, e.g. ``(100, 100, 20)`` for a slab. Defaults match
+        the reference example.
     label
         Optional label for the verbose printout. Defaults to the file stem if
         a path was given, else "network".
@@ -427,22 +461,21 @@ def analyze_network(
         if label is None:
             label = "network"
 
-    box_arr = np.asarray(box if hasattr(box, "__len__") else [box, box, box], dtype=float)
-    L = float(box_arr[0])
+    box_arr = _coerce_box(box)
 
     positions, edges, neighbors, _ = rods_to_network_degree3(rods, box_arr)
     N = len(positions)
 
-    bl = _bond_lengths(positions, edges, L)
-    angles, planarities = _angle_and_planarity(positions, edges, L)
-    chis = _skew_angles(positions, edges, L)
+    bl = _bond_lengths(positions, edges, box_arr)
+    angles, planarities = _angle_and_planarity(positions, edges, box_arr)
+    chis = _skew_angles(positions, edges, box_arr)
     rings = _shortest_ring_per_edge(N, edges)
     diag = cluster_diagnostics(positions, edges, neighbors, box_arr, d0, probe_grid=12)
     # Sellers Eq. 2 convention: Φ_nl = depth-n trees compared for root
     # vertices within l edges. Φ_12 ⇒ depth 1, locality 2.
     phi12 = compute_lsu(positions, edges, neighbors, box_arr, depth=1, locality=2)
     phi22 = compute_lsu(positions, edges, neighbors, box_arr, depth=2, locality=2)
-    phis_arr, h_dih = _dihedral_entropy(positions, edges, L)
+    phis_arr, h_dih = _dihedral_entropy(positions, edges, box_arr)
     kmag, S = _vertex_structure_factor(positions, box_arr, k_modes_max=k_modes_max)
     kc, sm, _ = _bin_structure_factor(kmag, S, nbins=24)
     sk2d_centers, sk2d_grid = _vertex_structure_factor_2d_slice(
@@ -485,7 +518,7 @@ def analyze_network(
         "chi_angles_deg": chis,
         "S_v_2d_k_centers": sk2d_centers,
         "S_v_2d_grid": sk2d_grid,
-        "box_L": L,
+        "box_L": box_arr.tolist(),
     }
 
     if verbose:
@@ -822,13 +855,15 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Analyse LSU network rod-endpoint file(s).")
     parser.add_argument("paths", nargs="+", help="One or more rod-endpoint files")
-    parser.add_argument("--box", type=float, default=11.44)
+    parser.add_argument("--box", type=float, nargs="+", default=[11.44],
+                        help="Box side length(s): one value (cube) or three (Lx Ly Lz slab)")
     parser.add_argument("--d0", type=float, default=0.8)
     parser.add_argument("--compare", action="store_true",
                         help="Print side-by-side comparison (default for >1 file)")
     args = parser.parse_args()
 
+    box_cli = args.box[0] if len(args.box) == 1 else args.box
     if len(args.paths) == 1 and not args.compare:
-        analyze_network(args.paths[0], box=args.box, d0=args.d0)
+        analyze_network(args.paths[0], box=box_cli, d0=args.d0)
     else:
-        compare_networks([(p, None) for p in args.paths], box=args.box, d0=args.d0)
+        compare_networks([(p, None) for p in args.paths], box=box_cli, d0=args.d0)

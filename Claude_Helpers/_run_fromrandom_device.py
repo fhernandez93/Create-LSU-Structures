@@ -8,7 +8,9 @@ parity-validated at N=1000+this schedule; re-check parity at N=4000 before trust
 (run a short device-vs-scipy comparison).
 
 Usage: python -m Claude_Helpers._run_fromrandom_device <N> <tag> <t_hot> <t_hold> <n_cool> <n_hold> [chunk] [seed]
-env: DEEP_RELAX (600), RELAX_ITERS (150)
+env: DEEP_RELAX (600), RELAX_ITERS (150),
+     BOX ("L" cube or "Lx,Ly,Lz" slab, e.g. "100,100,20"; overrides the
+     density-matched cube — check N gives the reference density N/V ~= 0.668/um^3)
 """
 import sys, os, json, time, datetime, math
 import numpy as np
@@ -26,8 +28,21 @@ n_hold = int(sys.argv[6]) if len(sys.argv) > 6 else 200000
 chunk = int(sys.argv[7]) if len(sys.argv) > 7 else 50000
 SEED = int(sys.argv[8]) if len(sys.argv) > 8 else 42
 D0 = 0.8
-BOX = (N / 1000.0) ** (1.0 / 3.0) * 11.44
-box = np.array([BOX]*3, float); W = (0.7, 0.7, 0.3, 0.4)
+_box_env = os.environ.get("BOX")
+if _box_env:
+    _v = [float(x) for x in _box_env.replace(",", " ").split()]
+    if len(_v) not in (1, 3):
+        raise ValueError(f"BOX env needs 1 or 3 values, got {_box_env!r}")
+    box = np.array(_v * 3 if len(_v) == 1 else _v, float)
+    _rho = N / float(np.prod(box))
+    _rho_ref = 1000.0 / 11.44 ** 3
+    if abs(_rho / _rho_ref - 1.0) > 0.02:
+        print(f"WARNING: density N/V={_rho:.4f} is {100*(_rho/_rho_ref-1):+.1f}% off "
+              f"the reference {_rho_ref:.4f}/um^3 the schedule is calibrated for.",
+              flush=True)
+else:
+    box = np.array([(N / 1000.0) ** (1.0 / 3.0) * 11.44] * 3, float)
+W = (0.7, 0.7, 0.3, 0.4)
 date = datetime.date.today().strftime("%Y%m%d")
 DEEP = int(os.environ.get("DEEP_RELAX", "600"))
 RELAX_ITERS = int(os.environ.get("RELAX_ITERS", "150"))
@@ -36,7 +51,7 @@ n_total = n_cool + n_hold
 gc = np.arange(n_cool)
 T_cool = t_hot * np.exp(math.log(t_hold / t_hot) * gc / max(1, n_cool - 1))
 T_full = np.concatenate([T_cool, np.full(n_hold, t_hold)])
-print(f"=== FROM-RANDOM DEVICE  N={N} box={BOX:.3f}  tag={tag} cool {t_hot}->{t_hold}x{n_cool} "
+print(f"=== FROM-RANDOM DEVICE  N={N} box={np.round(box, 3).tolist()}  tag={tag} cool {t_hot}->{t_hold}x{n_cool} "
       f"+ hold x{n_hold} = {n_total} ({n_total/N:.0f}/atom)  seed={SEED} ===", flush=True)
 
 import glob, re, tools

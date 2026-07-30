@@ -135,8 +135,23 @@ def _find_latest_checkpoint(tag, ckpt_dir, box, N):
 def generate_from_random(N=1000, seed=42, t_hot=0.09, t_cold=0.028, n_cool=250000,
                          n_hold=50000, t_hold=0.04, stage_b=True, fast=False,
                          relax_iters=150, checkpoint_every=0, checkpoint_tag=None,
-                         checkpoint_dir="Structures", resume=False, verbose=True):
+                         checkpoint_dir="Structures", resume=False, verbose=True,
+                         bounds=None):
     """Reproduce the from-random amorphous LSU network. Returns rod endpoints (M,6).
+
+    Box shape (`bounds`):
+      bounds=None (default) -> cubic box density-matched to the reference:
+        L = (N/1000)**(1/3) * 11.44, i.e. the validated behaviour.
+      bounds=(Lx, Ly, Lz)   -> orthorhombic box, e.g. (100, 100, 20) for a slab.
+        Pass N=None to auto-derive N from the box volume at the reference
+        density 1000/11.44^3 ~= 0.668 vertices/um^3 (rounded to even). If you
+        pass both N and bounds, a density more than 2% off the reference
+        raises a warning: the annealing T-schedule and d0=0.8 are calibrated
+        at the reference density, so off-density runs are unvalidated.
+        The whole pipeline (PBC, KD-trees, S(k) modes) is per-axis, so
+        anisotropic boxes need no other changes; note the low-k penalty /
+        Stage-B modes are integer (h,k,l) shells of the box, so along a short
+        axis (Lz=20) the lowest mode sits at 5x larger |k| than along Lx=100.
 
     NOTE: this is a long computation (~250-300 moves/atom of WWW annealing):
     ~hours on the scipy path, ~1/3 of that with fast=True (on-device). For a quick
@@ -149,7 +164,9 @@ def generate_from_random(N=1000, seed=42, t_hot=0.09, t_cold=0.028, n_cool=25000
       resume           : if True, auto-continue from the latest checkpoint for the tag.
     Checkpoints are written as <date>_<tag>_ck<k>k.txt (+ _edges.npy) -- the same
     format assess_statistics / _validate_fromrandom read, so you can validate any
-    intermediate state. Checkpointing does NOT change the final result.
+    intermediate state (for a non-cubic box pass bounds=... to assess_statistics,
+    or BOX env to the _validate_fromrandom CLI -- otherwise they assume the
+    density-matched cube). Checkpointing does NOT change the final result.
     Returns: 
     - pos — vertex (node) coordinates. Shape (N, dims), which is why N = len(pos). These are the physical positions of the network's atoms/nodes in the box. _save_checkpoint deep-relaxes them
         under the Keating potential (lsu.relax), wraps them back into the box (p2 - box*round(p2/box)), and writes them out.
@@ -159,10 +176,39 @@ def generate_from_random(N=1000, seed=42, t_hot=0.09, t_cold=0.028, n_cool=25000
     - rods end to end point of the actual rods
 
     """
-    box = np.array([(N / 1000 * 11.44 ** 3) ** (1 / 3)] * 3, float); D0 = 0.8
+    D0 = 0.8
+    RHO_REF = 1000.0 / 11.44 ** 3  # reference vertex density (per um^3)
+    if bounds is None:
+        if N is None:
+            raise ValueError("N is required when bounds is not given")
+        box = np.array([(N / 1000 * 11.44 ** 3) ** (1 / 3)] * 3, float)
+    else:
+        box = lsu.coerce_box(bounds)
+        V = float(np.prod(box))
+        if N is None:
+            N = 2 * int(round(RHO_REF * V / 2.0))  # nearest even N at ref density
+        else:
+            rho = N / V
+            if abs(rho / RHO_REF - 1.0) > 0.02:
+                import warnings
+                warnings.warn(
+                    f"generate_from_random: density N/V={rho:.4f} deviates "
+                    f"{100 * (rho / RHO_REF - 1):+.1f}% from the reference "
+                    f"{RHO_REF:.4f}/um^3 the recipe (d0=0.8, T-schedule) is "
+                    f"calibrated for. Pass N=None to auto-match density.",
+                    stacklevel=2)
+        if min(box) < 4 * D0:
+            raise ValueError(
+                f"bounds {box.tolist()}: the shortest axis must be >= 4*d0="
+                f"{4 * D0} for the periodic minimum-image convention to make sense")
     W = (0.7, 0.7, 0.3, 0.4)
     if checkpoint_every > 0 and not checkpoint_tag:
         raise ValueError("checkpoint_every>0 requires a checkpoint_tag")
+
+    # Move counts may arrive as floats (e.g. n_cool=275*N*1.1 in the notebook);
+    # the schedule arrays need exact integer lengths.
+    n_cool = int(round(n_cool)); n_hold = int(round(n_hold))
+    checkpoint_every = int(round(checkpoint_every))
 
     # Full schedule: slow-cool t_hot->t_cold over n_cool, then hold t_hold for n_hold.
     # (Built as one array so a chunked/checkpointed run is identical to the one-shot
